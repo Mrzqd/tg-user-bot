@@ -255,12 +255,14 @@ async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) ->
             return
         if progress:
             await progress.finish()
-        if progress_message:
-            await _edit_or_send(config.reaction_notify_chat_id, "正在保存到下载目标...", progress_message)
         file_size = _path_size(local_path)
         mime_type = _path_mime(local_path)
+        if progress:
+            await progress.reset("正在保存到下载目标", file_size)
+        elif progress_message:
+            await _edit_or_send(config.reaction_notify_chat_id, "正在保存到下载目标...", progress_message)
         try:
-            target = await finalize_download(local_path)
+            target = await finalize_download(local_path, progress)
         except Exception as e:
             await mark_media_download_failed(record.id, str(e))
             await _notify_finalize_failed(config.reaction_notify_chat_id, e, local_path, progress_message)

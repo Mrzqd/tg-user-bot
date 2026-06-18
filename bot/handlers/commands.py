@@ -442,11 +442,14 @@ async def _finish_download(
 ) -> None:
     if progress:
         await progress.finish()
-    await event.edit("正在保存到下载目标...")
     file_size = _path_size(file_path)
     mime_type = _path_mime(file_path)
+    if progress:
+        await progress.reset("正在保存到下载目标", file_size)
+    else:
+        await event.edit("正在保存到下载目标...")
     try:
-        target = await finalize_download(file_path)
+        target = await finalize_download(file_path, progress)
     except Exception as e:
         logger.warning("[Download] Finalize failed for {}: {}", file_path, e)
         if download_id:

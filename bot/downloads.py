@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.client
 import mimetypes
 import re
 import ssl
@@ -13,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlparse
 from urllib.request import (
     HTTPSHandler,
+    HTTPHandler,
     Request,
     build_opener,
     urlopen,
@@ -47,6 +49,7 @@ SETTING_WEBDAV_VERIFY_SSL = "download.webdav_verify_ssl"
 SETTING_REACTION_ENABLED = "reaction_download.enabled"
 SETTING_REACTION_EMOJI = "reaction_download.emoji"
 SETTING_REACTION_NOTIFY_CHAT_ID = "reaction_download.notify_chat_id"
+WEBDAV_UPLOAD_BLOCK_SIZE = 4 * 1024 * 1024
 
 DOWNLOAD_SETTING_KEYS = [
     SETTING_TARGET_TYPE,
@@ -76,6 +79,52 @@ class DownloadSettings:
     reaction_enabled: bool = False
     reaction_emoji: str = "👍"
     reaction_notify_chat_id: int = 0
+
+
+class ProgressFileReader:
+    def __init__(self, file_obj, callback=None, block_size: int = WEBDAV_UPLOAD_BLOCK_SIZE) -> None:
+        self.file_obj = file_obj
+        self.callback = callback
+        self.block_size = block_size
+        self.uploaded = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self.block_size
+        else:
+            size = min(size, self.block_size)
+        data = self.file_obj.read(size)
+        if data:
+            self.uploaded += len(data)
+            if self.callback:
+                self.callback(self.uploaded)
+        return data
+
+
+class LargeBlockHTTPConnection(http.client.HTTPConnection):
+    blocksize = WEBDAV_UPLOAD_BLOCK_SIZE
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("blocksize", WEBDAV_UPLOAD_BLOCK_SIZE)
+        super().__init__(*args, **kwargs)
+
+
+class LargeBlockHTTPSConnection(http.client.HTTPSConnection):
+    blocksize = WEBDAV_UPLOAD_BLOCK_SIZE
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("blocksize", WEBDAV_UPLOAD_BLOCK_SIZE)
+        super().__init__(*args, **kwargs)
+
+
+class LargeBlockHTTPHandler(HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(LargeBlockHTTPConnection, req)
+
+
+class LargeBlockHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(LargeBlockHTTPSConnection, req, context=self._context)
 
 
 def _to_bool(value: str | bool | None, default: bool) -> bool:
@@ -483,9 +532,11 @@ def _join_webdav_url(base_url: str, remote_path: str, filename: str) -> str:
 
 
 def _make_webdav_opener(download_settings: DownloadSettings):
-    handlers = []
+    handlers = [LargeBlockHTTPHandler()]
     if not download_settings.webdav_verify_ssl:
-        handlers.append(HTTPSHandler(context=ssl._create_unverified_context()))
+        handlers.append(LargeBlockHTTPSHandler(context=ssl._create_unverified_context()))
+    else:
+        handlers.append(LargeBlockHTTPSHandler())
     return build_opener(*handlers)
 
 
@@ -523,17 +574,23 @@ def _ensure_webdav_collections(opener, download_settings: DownloadSettings) -> N
             logger.debug("[WebDAV] MKCOL skipped/failed for {}: {}", current, e)
 
 
-def _put_webdav_file(opener, local_file: Path, target_url: str, download_settings: DownloadSettings) -> None:
+def _put_webdav_file(
+    opener,
+    local_file: Path,
+    target_url: str,
+    download_settings: DownloadSettings,
+    progress_callback=None,
+) -> None:
     with local_file.open("rb") as f:
-        req = Request(target_url, data=f, method="PUT")
+        data = ProgressFileReader(f, progress_callback, WEBDAV_UPLOAD_BLOCK_SIZE)
+        req = Request(target_url, data=data, method="PUT")
         _add_webdav_auth(req, download_settings)
         req.add_header("Content-Type", "application/octet-stream")
         req.add_header("Content-Length", str(local_file.stat().st_size))
-        req.add_header("Connection", "close")
         opener.open(req, timeout=300)
 
 
-def _upload_webdav_file(local_file: Path, download_settings: DownloadSettings) -> str:
+def _upload_webdav_file(local_file: Path, download_settings: DownloadSettings, progress_callback=None) -> str:
     if not download_settings.webdav_url:
         raise ValueError("WebDAV URL 未配置")
     if urlparse(download_settings.webdav_url).scheme not in {"http", "https"}:
@@ -551,7 +608,7 @@ def _upload_webdav_file(local_file: Path, download_settings: DownloadSettings) -
     last_error = None
     for attempt in range(1, 3):
         try:
-            _put_webdav_file(opener, local_file, target_url, download_settings)
+            _put_webdav_file(opener, local_file, target_url, download_settings, progress_callback)
             break
         except (BrokenPipeError, ConnectionResetError, TimeoutError, HTTPError, URLError, OSError) as e:
             last_error = e
@@ -564,13 +621,14 @@ def _upload_webdav_file(local_file: Path, download_settings: DownloadSettings) -
     return target_url
 
 
-async def finalize_download(local_file: str | Path) -> str:
+async def finalize_download(local_file: str | Path, progress=None) -> str:
     file_path = Path(local_file)
     download_settings = await get_download_settings()
     if download_settings.target_type != "webdav":
         return str(file_path)
 
-    target_url = await asyncio.to_thread(_upload_webdav_file, file_path, download_settings)
+    progress_callback = getattr(progress, "thread_callback", None) if progress else None
+    target_url = await asyncio.to_thread(_upload_webdav_file, file_path, download_settings, progress_callback)
     logger.info("[WebDAV] Uploaded {} -> {}", file_path, target_url)
     if not download_settings.keep_local:
         file_path.unlink(missing_ok=True)

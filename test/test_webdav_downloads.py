@@ -10,6 +10,7 @@ from urllib.request import Request
 
 from bot.downloads import (
     DownloadSettings,
+    WEBDAV_UPLOAD_BLOCK_SIZE,
     _add_webdav_auth,
     _ensure_webdav_collections,
     _join_webdav_url,
@@ -22,6 +23,7 @@ class FakeOpener:
         self.fail_first_put = fail_first_put
         self.requests: list[Request] = []
         self.put_attempts = 0
+        self.put_body_chunks: list[int] = []
 
     def open(self, req: Request, timeout: int = 0):
         self.requests.append(req)
@@ -29,6 +31,11 @@ class FakeOpener:
             self.put_attempts += 1
             if self.fail_first_put and self.put_attempts == 1:
                 raise BrokenPipeError("simulated broken pipe")
+            while True:
+                chunk = req.data.read(WEBDAV_UPLOAD_BLOCK_SIZE * 2)
+                if not chunk:
+                    break
+                self.put_body_chunks.append(len(chunk))
         return object()
 
 
@@ -90,6 +97,34 @@ class WebDavDownloadUnitTest(unittest.TestCase):
 
         self.assertEqual(target, "http://example.test/dav/local/tg/sample.txt")
         self.assertEqual(opener.put_attempts, 2)
+
+    def test_upload_uses_large_block_reader_and_progress_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.bin"
+            path.write_bytes(b"a" * (WEBDAV_UPLOAD_BLOCK_SIZE + 123))
+            settings = DownloadSettings(
+                webdav_url="http://example.test/dav",
+                webdav_username="user",
+                webdav_password="pass",
+                webdav_remote_path="/local/tg",
+            )
+
+            opener = FakeOpener()
+            progress_values: list[int] = []
+            import bot.downloads as downloads
+
+            original = downloads._make_webdav_opener
+            downloads._make_webdav_opener = lambda _: opener
+            try:
+                target = _upload_webdav_file(path, settings, progress_values.append)
+            finally:
+                downloads._make_webdav_opener = original
+
+        put_requests = [req for req in opener.requests if req.get_method() == "PUT"]
+        self.assertEqual(target, "http://example.test/dav/local/tg/sample.bin")
+        self.assertEqual(len(put_requests), 1)
+        self.assertEqual(opener.put_body_chunks, [WEBDAV_UPLOAD_BLOCK_SIZE, 123])
+        self.assertEqual(progress_values, [WEBDAV_UPLOAD_BLOCK_SIZE, WEBDAV_UPLOAD_BLOCK_SIZE + 123])
 
 
 class WebDavSmokeTest(unittest.TestCase):
