@@ -262,6 +262,8 @@ async def _download_media_parallel(
         return None
 
     request_size = _normalize_part_size(int(settings.download_part_size_kb or 512) * 1024)
+    if progress:
+        progress.label = f"{progress.label}（{threads} 线程）"
     target_path = _parallel_target_file_path(download_dir, message)
 
     def allocate() -> None:

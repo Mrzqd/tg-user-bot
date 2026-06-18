@@ -50,7 +50,7 @@ class Settings(BaseSettings):
 
     # Media downloads
     download_dir: str = str(BASE_DIR / "downloads")
-    download_threads: int = 4
+    download_threads: int = 16
     download_part_size_kb: int = 512
 
     # Logging
