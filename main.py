@@ -45,10 +45,7 @@ async def main() -> None:
     logger.info("API server starting on {}:{}", settings.api_host, settings.api_port)
 
     try:
-        await asyncio.gather(
-            server.serve(),
-            userbot.client.run_until_disconnected(),
-        )
+        await server.serve()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutting down...")
     finally:
