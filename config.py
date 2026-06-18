@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8080
     api_secret_key: str = "change-me"
+    web_username: str = "admin"
+    web_password: str = ""
+    web_session_ttl_hours: int = 24
+    turnstile_site_key: str = ""
+    turnstile_secret_key: str = ""
 
     # Database
     database_url: str = f"sqlite+aiosqlite:///{BASE_DIR / 'data' / 'userbot.db'}"

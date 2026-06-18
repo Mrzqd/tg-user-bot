@@ -83,7 +83,9 @@ docker attach tg-userbot
 
 启动后访问 `http://localhost:8080` 即可进入 Web Dashboard。
 
-在侧边栏底部输入 `.env` 中配置的 `API_SECRET_KEY` 即可认证。
+Web 控制台使用 `.env` 中的 `WEB_USERNAME` / `WEB_PASSWORD` 登录；未设置 `WEB_PASSWORD` 时会临时回退使用 `API_SECRET_KEY`。如需启用 Cloudflare Turnstile，在 `.env` 配置 `TURNSTILE_SITE_KEY` 和 `TURNSTILE_SECRET_KEY`。
+
+首次 Telegram 登录也在 Web 控制台完成：进入仪表盘后发送验证码、填写验证码；如果账号启用了二步验证，再填写二步密码。Docker 部署不再需要 attach 容器输入验证码。
 
 面板功能：
 - **Dashboard** - 状态总览 + 快速发消息

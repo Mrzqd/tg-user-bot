@@ -69,6 +69,24 @@ class ToggleIn(BaseModel):
     is_active: bool
 
 
+class WebLoginIn(BaseModel):
+    username: str
+    password: str
+    turnstile_token: str = ""
+
+
+class TelegramSendCodeIn(BaseModel):
+    phone: str
+
+
+class TelegramSignInIn(BaseModel):
+    code: str
+
+
+class TelegramPasswordIn(BaseModel):
+    password: str
+
+
 class DownloadSettingsIn(BaseModel):
     target_type: str = Field("local", description="local | webdav")
     local_path: str = ""
@@ -140,13 +158,14 @@ class MessageLogOut(BaseModel):
 
 
 class StatusOut(BaseModel):
-    user_id: int
+    user_id: Optional[int]
     username: Optional[str]
-    first_name: str
+    first_name: Optional[str]
     monitored_groups: int
     keyword_rules: int
     scheduled_tasks: int
     scheduler_running: bool
+    telegram_authorized: bool = False
 
 
 class DownloadSettingsOut(BaseModel):
@@ -158,3 +177,28 @@ class DownloadSettingsOut(BaseModel):
     webdav_remote_path: str
     webdav_verify_ssl: bool
     has_webdav_password: bool
+
+
+class WebLoginOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    turnstile_site_key: str
+
+
+class WebAuthConfigOut(BaseModel):
+    turnstile_site_key: str
+    turnstile_required: bool
+
+
+class TelegramAuthStatusOut(BaseModel):
+    connected: bool
+    authorized: bool
+    user_id: Optional[int] = None
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    phone: str = ""
+
+
+class TelegramSignInOut(BaseModel):
+    status: str

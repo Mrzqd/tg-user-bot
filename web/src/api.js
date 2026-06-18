@@ -1,4 +1,5 @@
 const API_KEY_STORAGE = 'tg_userbot_api_key'
+const TOKEN_STORAGE = 'tg_userbot_access_token'
 
 export function getApiKey() {
   return localStorage.getItem(API_KEY_STORAGE) || ''
@@ -8,13 +9,24 @@ export function setApiKey(key) {
   localStorage.setItem(API_KEY_STORAGE, key)
 }
 
+export function getAccessToken() {
+  return localStorage.getItem(TOKEN_STORAGE) || ''
+}
+
+export function setAccessToken(token) {
+  if (token) localStorage.setItem(TOKEN_STORAGE, token)
+  else localStorage.removeItem(TOKEN_STORAGE)
+}
+
 async function request(path, options = {}) {
   const key = getApiKey()
+  const token = getAccessToken()
   const res = await fetch(`/api${path}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
-      'X-API-Key': key,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(key ? { 'X-API-Key': key } : {}),
       ...options.headers,
     },
   })
@@ -26,8 +38,16 @@ async function request(path, options = {}) {
 }
 
 export const api = {
+  getAuthConfig: () => fetch('/api/auth/config').then(r => r.json()),
+  login: (data) => request('/auth/login', { method: 'POST', body: JSON.stringify(data) }),
+
   getStatus: () => request('/status'),
   getHealth: () => fetch('/health').then(r => r.json()),
+
+  getTelegramAuthStatus: () => request('/telegram-auth/status'),
+  sendTelegramCode: (data) => request('/telegram-auth/send-code', { method: 'POST', body: JSON.stringify(data) }),
+  signInTelegram: (data) => request('/telegram-auth/sign-in', { method: 'POST', body: JSON.stringify(data) }),
+  signInTelegramPassword: (data) => request('/telegram-auth/password', { method: 'POST', body: JSON.stringify(data) }),
 
   getGroups: () => request('/groups'),
   addGroup: (data) => request('/groups', { method: 'POST', body: JSON.stringify(data) }),

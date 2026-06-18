@@ -14,8 +14,8 @@ from config import settings
 from utils.logger import setup_logging
 from database.engine import init_db
 from bot.client import userbot
-from bot.handlers import register_all_handlers
 from bot import scheduler as sched_service
+from bot.runtime import start_runtime
 from api.app import create_app
 
 
@@ -26,11 +26,11 @@ async def main() -> None:
     await init_db()
     logger.info("Database initialized")
 
-    await userbot.start()
-    register_all_handlers()
-    await sched_service.load_all_jobs()
-    sched_service.start()
-    logger.info("Telegram client is running. Listening for events...")
+    authorized = await userbot.start_if_authorized()
+    if authorized:
+        await start_runtime()
+    else:
+        logger.info("API will start without Telegram authorization. Open web console to login.")
 
     app = create_app()
     config = uvicorn.Config(

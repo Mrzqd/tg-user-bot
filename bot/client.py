@@ -5,6 +5,7 @@ from typing import Optional
 
 from loguru import logger
 from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 
 from config import settings
 
@@ -15,6 +16,8 @@ class TelegramUserBot:
     _instance: Optional[TelegramUserBot] = None
     _client: Optional[TelegramClient] = None
     _started: bool = False
+    _phone_code_hash: str = ""
+    _login_phone: str = ""
 
     def __new__(cls) -> TelegramUserBot:
         if cls._instance is None:
@@ -30,6 +33,10 @@ class TelegramUserBot:
     @property
     def is_connected(self) -> bool:
         return self._client is not None and self._client.is_connected()
+
+    @property
+    def is_authorized(self) -> bool:
+        return self._started
 
     async def init(self) -> None:
         if self._client is not None:
@@ -55,6 +62,23 @@ class TelegramUserBot:
         )
         logger.info("Telegram client created (session={})", settings.tg_session_name)
 
+    async def connect(self) -> None:
+        await self.init()
+        if not self.client.is_connected():
+            await self.client.connect()
+
+    async def start_if_authorized(self) -> bool:
+        if self._started:
+            return True
+        await self.connect()
+        if not await self.client.is_user_authorized():
+            logger.warning("Telegram session is not authorized. Login from web console is required.")
+            return False
+        me = await self.client.get_me()
+        logger.info("Logged in as {} (id={})", me.first_name, me.id)
+        self._started = True
+        return True
+
     async def start(self) -> None:
         if self._started:
             return
@@ -66,6 +90,37 @@ class TelegramUserBot:
         me = await self.client.get_me()
         logger.info("Logged in as {} (id={})", me.first_name, me.id)
         self._started = True
+
+    async def send_login_code(self, phone: str) -> None:
+        await self.connect()
+        sent = await self.client.send_code_request(phone)
+        self._login_phone = phone
+        self._phone_code_hash = sent.phone_code_hash
+        logger.info("Telegram login code sent to {}", phone)
+
+    async def sign_in_with_code(self, code: str) -> str:
+        await self.connect()
+        if not self._login_phone or not self._phone_code_hash:
+            raise RuntimeError("请先发送验证码")
+        try:
+            await self.client.sign_in(
+                phone=self._login_phone,
+                code=code,
+                phone_code_hash=self._phone_code_hash,
+            )
+        except SessionPasswordNeededError:
+            return "password_needed"
+        me = await self.client.get_me()
+        self._started = True
+        logger.info("Telegram login completed as {} (id={})", me.first_name, me.id)
+        return "authorized"
+
+    async def sign_in_with_password(self, password: str) -> None:
+        await self.connect()
+        await self.client.sign_in(password=password)
+        me = await self.client.get_me()
+        self._started = True
+        logger.info("Telegram 2FA login completed as {} (id={})", me.first_name, me.id)
 
     async def stop(self) -> None:
         if self._client and self._started:

@@ -1,5 +1,6 @@
 <template>
-  <AppLayout>
+  <Login v-if="!loggedIn" @logged-in="loggedIn = true" />
+  <AppLayout v-else>
     <router-view />
   </AppLayout>
   <div class="fixed top-5 right-5 z-300 flex flex-col gap-2">
@@ -14,8 +15,11 @@
 <script setup>
 import { ref, provide } from 'vue'
 import AppLayout from './components/AppLayout.vue'
+import Login from './views/Login.vue'
+import { getAccessToken } from './api.js'
 
 const toasts = ref([])
+const loggedIn = ref(Boolean(getAccessToken()))
 let toastId = 0
 
 function toast(msg, type = 'success') {

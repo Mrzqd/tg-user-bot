@@ -6,7 +6,9 @@
           <span class="w-2 h-2 rounded-full inline-block" :class="connected ? 'bg-ok' : 'bg-err'"></span>
           <span>TG Userbot</span>
         </h1>
-        <p v-if="statusInfo" class="text-xs text-dim mt-1">{{ statusInfo.first_name }} · @{{ statusInfo.username }}</p>
+        <p v-if="statusInfo" class="text-xs text-dim mt-1">
+          {{ statusInfo.telegram_authorized ? `${statusInfo.first_name || 'Telegram'} · @${statusInfo.username || '—'}` : 'Telegram 未登录' }}
+        </p>
       </div>
       <nav class="flex-1 p-3 flex flex-col gap-0.5">
         <router-link v-for="item in nav" :key="item.to" :to="item.to"
@@ -18,8 +20,7 @@
         </router-link>
       </nav>
       <div class="px-4 py-4 border-t border-border">
-        <label class="text-[11px] text-dim mb-1.5 block">API 密钥</label>
-        <input class="input-base !text-xs !py-1.5" type="password" placeholder="输入 API Key" :value="apiKey" @input="onKeyChange" />
+        <button class="btn-ghost w-full justify-center !py-1.5 !text-xs" @click="logout">退出登录</button>
       </div>
     </aside>
     <main class="flex-1 ml-56 p-7 min-h-screen"><slot /></main>
@@ -28,7 +29,7 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
-import { getApiKey, setApiKey, api } from '../api.js'
+import { api, setAccessToken } from '../api.js'
 
 const nav = [
   { to: '/', label: '仪表盘', icon: '&#9632;' },
@@ -40,16 +41,15 @@ const nav = [
   { to: '/help', label: '命令帮助', icon: '&#10068;' },
 ]
 
-const apiKey = ref(getApiKey())
 const connected = ref(false)
 const statusInfo = ref(null)
 
-function onKeyChange(e) { apiKey.value = e.target.value; setApiKey(e.target.value); fetchStatus() }
+function logout() { setAccessToken(''); location.reload() }
 
 async function fetchStatus() {
   try {
     const h = await api.getHealth(); connected.value = h.connected
-    if (getApiKey()) statusInfo.value = await api.getStatus()
+    statusInfo.value = await api.getStatus()
   } catch { connected.value = false }
 }
 

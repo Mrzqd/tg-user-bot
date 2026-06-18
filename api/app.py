@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from api.deps import verify_api_key
 from api.models import StatusOut
-from api.routes import groups, rules, scheduler, messages, settings as settings_routes
+from api.routes import auth, groups, rules, scheduler, messages, settings as settings_routes, telegram_auth
 from bot.client import userbot
 from bot import scheduler as sched_service
 from config import BASE_DIR
@@ -39,22 +39,26 @@ def create_app() -> FastAPI:
     app.include_router(scheduler.router, prefix="/api")
     app.include_router(messages.router, prefix="/api")
     app.include_router(settings_routes.router, prefix="/api")
+    app.include_router(auth.router, prefix="/api")
+    app.include_router(telegram_auth.router, prefix="/api")
 
     @app.get("/api/status", response_model=StatusOut, tags=["System"])
     async def get_status(api_key: str = Depends(verify_api_key)):
-        me = await userbot.get_me()
+        authorized = userbot.is_connected and await userbot.client.is_user_authorized()
+        me = await userbot.get_me() if authorized else None
         async with async_session() as session:
             grps = await crud.get_active_groups(session)
             rls = await crud.get_all_rules(session)
             schs = await crud.get_all_schedules(session)
         return StatusOut(
-            user_id=me.id,
-            username=me.username,
-            first_name=me.first_name,
+            user_id=me.id if me else None,
+            username=me.username if me else None,
+            first_name=me.first_name if me else None,
             monitored_groups=len(grps),
             keyword_rules=len(rls),
             scheduled_tasks=len(schs),
             scheduler_running=sched_service.scheduler.running,
+            telegram_authorized=authorized,
         )
 
     @app.get("/health", tags=["System"])
