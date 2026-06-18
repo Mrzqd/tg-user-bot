@@ -179,6 +179,114 @@ class ReactionPollingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(processed, ["poll reaction count increased 1->2"])
 
+    async def test_process_reacted_media_uses_progress_notification(self):
+        chat = SimpleNamespace(id=1001, title="group-a")
+        message = SimpleNamespace(
+            id=10,
+            chat_id=1001,
+            media=SimpleNamespace(),
+            reactions=SimpleNamespace(
+                results=[SimpleNamespace(reaction=SimpleNamespace(emoticon="👍"), count=1)],
+            ),
+        )
+        config = SimpleNamespace(reaction_emoji="👍", reaction_notify_chat_id=2001)
+        progress_calls: list[str] = []
+
+        class FakeProgress:
+            def __init__(self, event, label, total=None):
+                progress_calls.append(f"init:{label}:{total}")
+                self.event = event
+
+            async def start(self):
+                progress_calls.append("start")
+
+            async def finish(self):
+                progress_calls.append("finish")
+
+        class FakeNotification:
+            def __init__(self):
+                self.edits: list[str] = []
+
+            async def edit(self, text):
+                self.edits.append(text)
+
+        notification = FakeNotification()
+
+        async def fake_create_record(**kwargs):
+            return SimpleNamespace(id=11)
+
+        async def fake_get_download_dir():
+            return "/tmp"
+
+        async def fake_download(download_msg, download_dir, progress):
+            progress_calls.append(f"download:{download_dir}:{progress is not None}")
+            return "/tmp/video.mp4"
+
+        async def fake_finalize(local_path):
+            progress_calls.append(f"finalize:{local_path}")
+            return "/downloads/video.mp4"
+
+        async def fake_completed(*args, **kwargs):
+            progress_calls.append("completed")
+
+        async def fake_failed(*args, **kwargs):
+            progress_calls.append("failed")
+
+        class FakeClient:
+            async def send_message(self, chat_id, text):
+                progress_calls.append(f"send:{chat_id}:{text}")
+                return notification
+
+        originals = {
+            "client": getattr(reactions.userbot, "_client", None),
+            "progress": reactions.DownloadProgress,
+            "create_record": reactions.create_media_download_record,
+            "get_download_dir": reactions.get_download_dir,
+            "download": reactions._download_telegram_media,
+            "finalize": reactions.finalize_download,
+            "completed": reactions.mark_media_download_completed,
+            "failed": reactions.mark_media_download_failed,
+            "size": reactions._path_size,
+            "mime": reactions._path_mime,
+            "media_size": reactions._message_media_size,
+        }
+        reactions.userbot._client = FakeClient()
+        reactions.DownloadProgress = FakeProgress
+        reactions.create_media_download_record = fake_create_record
+        reactions.get_download_dir = fake_get_download_dir
+        reactions._download_telegram_media = fake_download
+        reactions.finalize_download = fake_finalize
+        reactions.mark_media_download_completed = fake_completed
+        reactions.mark_media_download_failed = fake_failed
+        reactions._path_size = lambda _: 1024
+        reactions._path_mime = lambda _: "video/mp4"
+        reactions._message_media_size = lambda _: 2048
+        try:
+            await reactions._process_reacted_media(chat, message, message.id, config, "test")
+        finally:
+            reactions.userbot._client = originals["client"]
+            reactions.DownloadProgress = originals["progress"]
+            reactions.create_media_download_record = originals["create_record"]
+            reactions.get_download_dir = originals["get_download_dir"]
+            reactions._download_telegram_media = originals["download"]
+            reactions.finalize_download = originals["finalize"]
+            reactions.mark_media_download_completed = originals["completed"]
+            reactions.mark_media_download_failed = originals["failed"]
+            reactions._path_size = originals["size"]
+            reactions._path_mime = originals["mime"]
+            reactions._message_media_size = originals["media_size"]
+
+        self.assertIn("send:2001:正在下载 Telegram 媒体资源", progress_calls)
+        self.assertIn("init:正在下载 Telegram 媒体资源:2048", progress_calls)
+        self.assertIn("start", progress_calls)
+        self.assertIn("download:/tmp:True", progress_calls)
+        self.assertIn("finish", progress_calls)
+        self.assertIn("completed", progress_calls)
+        self.assertEqual(
+            notification.edits,
+            ["正在保存到下载目标...", "下载完成: `/downloads/video.mp4`"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

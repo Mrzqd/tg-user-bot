@@ -14,13 +14,14 @@ from telethon import events
 from bot.client import userbot
 from bot.downloads import (
     create_media_download_record,
-    download_telegram_media_message,
     finalize_download,
     get_download_settings,
+    get_download_dir,
     mark_media_download_completed,
     mark_media_download_failed,
     telegram_source_url,
 )
+from bot.handlers.commands import DownloadProgress, _download_telegram_media, _message_media_size
 
 REACTION_CACHE_TTL = 12 * 3600
 REACTION_POLL_INTERVAL = 20
@@ -179,19 +180,41 @@ def _display_path(path: str) -> str:
     return str(path)
 
 
-async def _notify_download_success(chat_id: int, target: str) -> None:
-    await userbot.send_message(chat_id, f"下载完成: `{_display_path(target)}`")
+async def _edit_or_send(chat_id: int, text: str, message=None) -> None:
+    if message is not None:
+        try:
+            await message.edit(text)
+            return
+        except Exception as e:
+            logger.debug("[ReactionDownload] Failed to edit notification message: {}", e)
+    await userbot.send_message(chat_id, text)
 
 
-async def _notify_finalize_failed(chat_id: int, error: Exception, local_path: str) -> None:
-    await userbot.send_message(
+async def _create_download_progress(chat_id: int, msg) -> tuple[object | None, DownloadProgress | None]:
+    try:
+        message = await userbot.client.send_message(chat_id, "正在下载 Telegram 媒体资源")
+        progress = DownloadProgress(message, "正在下载 Telegram 媒体资源", _message_media_size(msg))
+        await progress.start()
+        return message, progress
+    except Exception as e:
+        logger.warning("[ReactionDownload] Failed to create progress notification: {}", e)
+        return None, None
+
+
+async def _notify_download_success(chat_id: int, target: str, message=None) -> None:
+    await _edit_or_send(chat_id, f"下载完成: `{_display_path(target)}`", message)
+
+
+async def _notify_finalize_failed(chat_id: int, error: Exception, local_path: str, message=None) -> None:
+    await _edit_or_send(
         chat_id,
         f"下载完成，但保存到目标失败: `{error}`\n本地文件: `{_display_path(local_path)}`",
+        message,
     )
 
 
-async def _notify_download_failed(chat_id: int, error: Exception | str) -> None:
-    await userbot.send_message(chat_id, f"下载失败: `{error}`")
+async def _notify_download_failed(chat_id: int, error: Exception | str, message=None) -> None:
+    await _edit_or_send(chat_id, f"下载失败: `{error}`", message)
 
 
 async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) -> None:
@@ -215,30 +238,38 @@ async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) ->
             source_chat=source_chat,
             source_message_id=msg_id,
         )
+        progress_message = None
+        progress = None
         try:
-            local_path = await download_telegram_media_message(msg)
+            progress_message, progress = await _create_download_progress(config.reaction_notify_chat_id, msg)
+            download_dir = await get_download_dir()
+            local_path = await _download_telegram_media(msg, download_dir, progress)
         except Exception as e:
             await mark_media_download_failed(record.id, str(e))
-            await _notify_download_failed(config.reaction_notify_chat_id, e)
+            await _notify_download_failed(config.reaction_notify_chat_id, e, progress_message)
             logger.warning("[ReactionDownload] Download failed msg={}: {}", msg_id, e)
             return
         if not local_path:
             await mark_media_download_failed(record.id, "Telegram 未返回文件路径")
-            await _notify_download_failed(config.reaction_notify_chat_id, "Telegram 未返回文件路径")
+            await _notify_download_failed(config.reaction_notify_chat_id, "Telegram 未返回文件路径", progress_message)
             return
+        if progress:
+            await progress.finish()
+        if progress_message:
+            await _edit_or_send(config.reaction_notify_chat_id, "正在保存到下载目标...", progress_message)
         file_size = _path_size(local_path)
         mime_type = _path_mime(local_path)
         try:
             target = await finalize_download(local_path)
         except Exception as e:
             await mark_media_download_failed(record.id, str(e))
-            await _notify_finalize_failed(config.reaction_notify_chat_id, e, local_path)
+            await _notify_finalize_failed(config.reaction_notify_chat_id, e, local_path, progress_message)
             logger.warning("[ReactionDownload] Finalize failed msg={}: {}", msg_id, e)
             return
         await mark_media_download_completed(record.id, local_path, target, file_size=file_size, mime_type=mime_type)
 
         chat_title = getattr(chat, "title", None) or getattr(chat, "username", None) or source_chat
-        await _notify_download_success(config.reaction_notify_chat_id, target)
+        await _notify_download_success(config.reaction_notify_chat_id, target, progress_message)
         count = _message_reaction_count(msg, config.reaction_emoji.strip() or "👍")
         if count is not None:
             _last_reaction_counts[key] = count
