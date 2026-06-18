@@ -1,1 +1,1 @@
-from bot.client import TelegramUserBot  # noqa: F401
+"""Telegram userbot package."""

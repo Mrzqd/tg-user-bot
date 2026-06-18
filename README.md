@@ -130,6 +130,22 @@ DOWNLOAD_PART_SIZE_KB=512
 
 下载速度受 Telegram DC、代理、CPU 加解密和 MTProto 连接吞吐影响。项目依赖 `cryptg` 加速 Telethon 加解密；如线程数过高触发不稳定或限速，可将 `DOWNLOAD_THREADS` 调回 `8` 或 `4`。
 
+WebDAV 上传单测：
+
+```bash
+python -m unittest discover -s test -p 'test_webdav_downloads.py' -v
+```
+
+WebDAV 真实冒烟测试（会上传一个小文本文件）：
+
+```bash
+WEBDAV_SMOKE_URL='http://your-host:5244/dav' \
+WEBDAV_SMOKE_USERNAME='username' \
+WEBDAV_SMOKE_PASSWORD='password' \
+WEBDAV_SMOKE_REMOTE_PATH='/local/tg' \
+python -m unittest discover -s test -p 'test_webdav_downloads.py' -k real_webdav -v
+```
+
 ### 监控
 
 | 命令 | 说明 |

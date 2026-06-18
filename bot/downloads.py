@@ -1,24 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import ssl
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.error import HTTPError
-from urllib.parse import quote, urljoin
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urljoin, urlparse
 from urllib.request import (
-    HTTPPasswordMgrWithDefaultRealm,
-    HTTPBasicAuthHandler,
     HTTPSHandler,
     Request,
     build_opener,
 )
 
 from loguru import logger
-
-from config import BASE_DIR, settings
-from database import crud
-from database.engine import async_session
 
 
 SETTING_TARGET_TYPE = "download.target_type"
@@ -63,6 +59,8 @@ def _to_bool(value: str | bool | None, default: bool) -> bool:
 
 
 def _resolve_local_path(path: str) -> Path:
+    from config import BASE_DIR, settings
+
     raw = Path(path or settings.download_dir).expanduser()
     if not raw.is_absolute():
         raw = BASE_DIR / raw
@@ -70,6 +68,10 @@ def _resolve_local_path(path: str) -> Path:
 
 
 async def get_download_settings() -> DownloadSettings:
+    from config import settings
+    from database import crud
+    from database.engine import async_session
+
     async with async_session() as session:
         values = await crud.get_settings(session, DOWNLOAD_SETTING_KEYS)
 
@@ -90,6 +92,9 @@ async def get_download_settings() -> DownloadSettings:
 
 
 async def save_download_settings(new_settings: DownloadSettings) -> None:
+    from database import crud
+    from database.engine import async_session
+
     values = {
         SETTING_TARGET_TYPE: new_settings.target_type,
         SETTING_LOCAL_PATH: new_settings.local_path,
@@ -121,30 +126,23 @@ def _join_webdav_url(base_url: str, remote_path: str, filename: str) -> str:
     return urljoin(base, quote(filename))
 
 
-def _make_webdav_opener(download_settings: DownloadSettings, target_url: str):
+def _make_webdav_opener(download_settings: DownloadSettings):
     handlers = []
     if not download_settings.webdav_verify_ssl:
         handlers.append(HTTPSHandler(context=ssl._create_unverified_context()))
-    if download_settings.webdav_username:
-        manager = HTTPPasswordMgrWithDefaultRealm()
-        manager.add_password(
-            None,
-            download_settings.webdav_url,
-            download_settings.webdav_username,
-            download_settings.webdav_password,
-        )
-        manager.add_password(
-            None,
-            target_url,
-            download_settings.webdav_username,
-            download_settings.webdav_password,
-        )
-        handlers.append(HTTPBasicAuthHandler(manager))
     return build_opener(*handlers)
 
 
-def _ensure_webdav_collection(opener, url: str) -> None:
+def _add_webdav_auth(req: Request, download_settings: DownloadSettings) -> None:
+    if not download_settings.webdav_username:
+        return
+    raw = f"{download_settings.webdav_username}:{download_settings.webdav_password}".encode()
+    req.add_header("Authorization", f"Basic {base64.b64encode(raw).decode()}")
+
+
+def _ensure_webdav_collection(opener, url: str, download_settings: DownloadSettings) -> None:
     req = Request(url, method="MKCOL")
+    _add_webdav_auth(req, download_settings)
     try:
         opener.open(req, timeout=30)
     except HTTPError as e:
@@ -152,29 +150,61 @@ def _ensure_webdav_collection(opener, url: str) -> None:
             raise
 
 
+def _ensure_webdav_collections(opener, download_settings: DownloadSettings) -> None:
+    remote_path = download_settings.webdav_remote_path.strip("/")
+    if not remote_path:
+        return
+
+    base = download_settings.webdav_url.rstrip("/") + "/"
+    current = base
+    for part in remote_path.split("/"):
+        if not part:
+            continue
+        current = urljoin(current, quote(part) + "/")
+        try:
+            _ensure_webdav_collection(opener, current, download_settings)
+        except Exception as e:
+            logger.debug("[WebDAV] MKCOL skipped/failed for {}: {}", current, e)
+
+
+def _put_webdav_file(opener, local_file: Path, target_url: str, download_settings: DownloadSettings) -> None:
+    with local_file.open("rb") as f:
+        req = Request(target_url, data=f, method="PUT")
+        _add_webdav_auth(req, download_settings)
+        req.add_header("Content-Type", "application/octet-stream")
+        req.add_header("Content-Length", str(local_file.stat().st_size))
+        req.add_header("Connection", "close")
+        opener.open(req, timeout=300)
+
+
 def _upload_webdav_file(local_file: Path, download_settings: DownloadSettings) -> str:
     if not download_settings.webdav_url:
         raise ValueError("WebDAV URL 未配置")
+    if urlparse(download_settings.webdav_url).scheme not in {"http", "https"}:
+        raise ValueError("WebDAV URL 必须以 http:// 或 https:// 开头")
 
     target_url = _join_webdav_url(
         download_settings.webdav_url,
         download_settings.webdav_remote_path,
         local_file.name,
     )
-    opener = _make_webdav_opener(download_settings, target_url)
+    opener = _make_webdav_opener(download_settings)
 
-    parent_url = target_url.rsplit("/", 1)[0] + "/"
-    if download_settings.webdav_remote_path.strip("/"):
+    _ensure_webdav_collections(opener, download_settings)
+
+    last_error = None
+    for attempt in range(1, 3):
         try:
-            _ensure_webdav_collection(opener, parent_url)
-        except Exception as e:
-            logger.debug("[WebDAV] MKCOL skipped/failed for {}: {}", parent_url, e)
-
-    with local_file.open("rb") as f:
-        req = Request(target_url, data=f, method="PUT")
-        req.add_header("Content-Type", "application/octet-stream")
-        req.add_header("Content-Length", str(local_file.stat().st_size))
-        opener.open(req, timeout=120)
+            _put_webdav_file(opener, local_file, target_url, download_settings)
+            break
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, HTTPError, URLError, OSError) as e:
+            last_error = e
+            if attempt >= 2:
+                raise
+            logger.warning("[WebDAV] PUT failed (attempt {}), retrying: {}", attempt, e)
+            time.sleep(1)
+    if last_error:
+        logger.debug("[WebDAV] PUT recovered after retry: {}", last_error)
     return target_url
 
 
