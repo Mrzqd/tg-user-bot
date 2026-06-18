@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from api.deps import verify_api_key
 from api.models import StatusOut
-from api.routes import auth, groups, rules, scheduler, messages, settings as settings_routes, telegram_auth
+from api.routes import auth, downloads, groups, rules, scheduler, messages, settings as settings_routes, telegram_auth
 from bot.client import userbot
 from bot import scheduler as sched_service
 from config import BASE_DIR
@@ -38,6 +38,7 @@ def create_app() -> FastAPI:
     app.include_router(rules.router, prefix="/api")
     app.include_router(scheduler.router, prefix="/api")
     app.include_router(messages.router, prefix="/api")
+    app.include_router(downloads.router, prefix="/api")
     app.include_router(settings_routes.router, prefix="/api")
     app.include_router(auth.router, prefix="/api")
     app.include_router(telegram_auth.router, prefix="/api")

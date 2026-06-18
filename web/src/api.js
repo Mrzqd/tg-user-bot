@@ -78,4 +78,10 @@ export const api = {
   getDownloadSettings: () => request('/settings/download'),
   updateDownloadSettings: (data) =>
     request('/settings/download', { method: 'PUT', body: JSON.stringify(data) }),
+
+  getDownloads: (params = {}) => {
+    const qs = new URLSearchParams(params).toString()
+    return request(`/downloads${qs ? '?' + qs : ''}`)
+  },
+  retryDownload: (id) => request(`/downloads/${id}/retry`, { method: 'POST' }),
 }

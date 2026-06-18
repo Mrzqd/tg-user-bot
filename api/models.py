@@ -185,6 +185,31 @@ class DownloadSettingsOut(BaseModel):
     reaction_notify_chat_id: int
 
 
+class MediaDownloadOut(BaseModel):
+    id: int
+    source_type: str
+    source_url: str
+    source_chat: str
+    source_message_id: int
+    trigger_type: str
+    status: str
+    target_type: str
+    target_path: str
+    local_path: str
+    file_name: str
+    mime_type: str
+    file_size: int
+    error: str
+    retry_count: int
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    duration_ms: int
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class WebLoginOut(BaseModel):
     access_token: str
     token_type: str = "bearer"

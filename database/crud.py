@@ -6,7 +6,7 @@ from typing import Sequence
 from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.models import AppSetting, MonitoredGroup, KeywordRule, ScheduledMessage, MessageLog, _now_cst
+from database.models import AppSetting, MonitoredGroup, KeywordRule, ScheduledMessage, MessageLog, MediaDownload, _now_cst
 
 
 # ──────────────────────── MonitoredGroup ────────────────────────
@@ -205,6 +205,66 @@ async def get_message_logs(
         stmt = stmt.where(MessageLog.chat_id == chat_id)
     result = await session.execute(stmt)
     return result.scalars().all()
+
+
+# ──────────────────────── MediaDownload ────────────────────────
+
+async def create_media_download(
+    session: AsyncSession,
+    source_type: str,
+    trigger_type: str,
+    source_url: str = "",
+    source_chat: str = "",
+    source_message_id: int = 0,
+    status: str = "pending",
+) -> MediaDownload:
+    item = MediaDownload(
+        source_type=source_type,
+        trigger_type=trigger_type,
+        source_url=source_url,
+        source_chat=source_chat,
+        source_message_id=source_message_id,
+        status=status,
+    )
+    session.add(item)
+    await session.commit()
+    await session.refresh(item)
+    return item
+
+
+async def get_media_download(session: AsyncSession, download_id: int) -> MediaDownload | None:
+    result = await session.execute(select(MediaDownload).where(MediaDownload.id == download_id))
+    return result.scalar_one_or_none()
+
+
+async def get_media_downloads(
+    session: AsyncSession,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Sequence[MediaDownload]:
+    stmt = select(MediaDownload).order_by(MediaDownload.id.desc()).limit(limit).offset(offset)
+    if status:
+        stmt = stmt.where(MediaDownload.status == status)
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def update_media_download(
+    session: AsyncSession,
+    download_id: int,
+    **kwargs,
+) -> MediaDownload | None:
+    item = await get_media_download(session, download_id)
+    if not item:
+        return None
+    for key, value in kwargs.items():
+        if hasattr(item, key):
+            setattr(item, key, value)
+    item.updated_at = _now_cst()
+    await session.commit()
+    await session.refresh(item)
+    return item
 
 
 # ──────────────────────── AppSetting ────────────────────────

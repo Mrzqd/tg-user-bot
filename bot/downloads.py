@@ -3,22 +3,37 @@ from __future__ import annotations
 import asyncio
 import base64
 import mimetypes
+import re
 import ssl
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 from urllib.request import (
     HTTPSHandler,
     Request,
     build_opener,
+    urlopen,
 )
 
 from loguru import logger
 
 TZ_CST = timezone(timedelta(hours=8))
+URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
+TELEGRAM_MESSAGE_HOSTS = {"t.me", "telegram.me", "www.t.me", "www.telegram.me"}
+MEDIA_MIME_PREFIXES = ("image/", "video/", "audio/")
+MEDIA_MIME_TYPES = {
+    "application/pdf",
+    "application/octet-stream",
+}
+MEDIA_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
+    ".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi",
+    ".mp3", ".m4a", ".wav", ".ogg", ".flac",
+    ".pdf",
+}
 
 
 SETTING_TARGET_TYPE = "download.target_type"
@@ -141,6 +156,105 @@ def _clean_filename(filename: str) -> str:
     return cleaned[:180] or "download"
 
 
+def _content_type(headers) -> str:
+    return (headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+
+
+def _url_extension(url: str) -> str:
+    return Path(unquote(urlparse(url).path)).suffix.lower()
+
+
+def _is_media_resource(content_type: str, url: str, content_disposition: str = "") -> bool:
+    if content_type.startswith(MEDIA_MIME_PREFIXES) or content_type in MEDIA_MIME_TYPES:
+        return True
+
+    guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
+    if guessed_type and (
+        guessed_type.startswith(MEDIA_MIME_PREFIXES) or guessed_type in MEDIA_MIME_TYPES
+    ):
+        return True
+
+    if _url_extension(url) in MEDIA_EXTENSIONS:
+        return True
+
+    return bool(content_disposition and "attachment" in content_disposition.lower() and content_type != "text/html")
+
+
+def _filename_from_content_disposition(content_disposition: str) -> str | None:
+    if not content_disposition:
+        return None
+
+    encoded_match = re.search(r"filename\*=(?:[^']*'')?([^;]+)", content_disposition, re.IGNORECASE)
+    if encoded_match:
+        return unquote(encoded_match.group(1).strip().strip('"'))
+
+    plain_match = re.search(r'filename="?([^";]+)"?', content_disposition, re.IGNORECASE)
+    if plain_match:
+        return plain_match.group(1).strip()
+
+    return None
+
+
+def parse_telegram_message_link(url: str) -> tuple[str | int, int] | None:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in TELEGRAM_MESSAGE_HOSTS:
+        return None
+
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if parts and parts[0] == "s":
+        parts = parts[1:]
+    if len(parts) < 2:
+        return None
+
+    if parts[0] == "c":
+        if len(parts) < 3 or not parts[1].isdigit() or not parts[-1].isdigit():
+            return None
+        return int(f"-100{parts[1]}"), int(parts[-1])
+
+    username = parts[0]
+    if username.startswith("+") or username in {"joinchat", "share", "addstickers"}:
+        return None
+    if not parts[-1].isdigit():
+        return None
+    return username, int(parts[-1])
+
+
+def extract_urls(text: str) -> list[str]:
+    urls = []
+    seen = set()
+    for match in URL_RE.finditer(text or ""):
+        url = match.group(0).rstrip(".,，。!！?？;；:：)]}）】》")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        if url not in seen:
+            urls.append(url)
+            seen.add(url)
+    return urls
+
+
+def extract_message_urls(message) -> list[str]:
+    urls = []
+    seen = set()
+    for url in extract_urls(getattr(message, "raw_text", "") or getattr(message, "message", "") or ""):
+        urls.append(url)
+        seen.add(url)
+
+    for entity in getattr(message, "entities", None) or []:
+        url = getattr(entity, "url", None)
+        if not url:
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        if url not in seen:
+            urls.append(url)
+            seen.add(url)
+
+    return urls
+
+
 def _message_media_filename(message) -> str:
     media = getattr(message, "media", None)
     document = getattr(media, "document", None)
@@ -173,6 +287,128 @@ def _telegram_target_file_path(download_dir: Path, message) -> Path:
     return target.with_name(f"{stem}_{datetime.now(TZ_CST):%Y%m%d%H%M%S}{suffix}")
 
 
+def _target_file_path(download_dir: Path, url: str, headers) -> Path:
+    content_type = _content_type(headers)
+    filename = _filename_from_content_disposition(headers.get("Content-Disposition") or "")
+    if not filename:
+        filename = Path(unquote(urlparse(url).path)).name or "download"
+
+    filename = _clean_filename(filename)
+    target = download_dir / filename
+
+    if not target.suffix and content_type:
+        ext = mimetypes.guess_extension(content_type)
+        if ext:
+            target = target.with_suffix(ext)
+
+    if not target.exists():
+        return target
+
+    stem = target.stem
+    suffix = target.suffix
+    for idx in range(1, 1000):
+        candidate = target.with_name(f"{stem}_{idx}{suffix}")
+        if not candidate.exists():
+            return candidate
+    return target.with_name(f"{stem}_{datetime.now(TZ_CST):%Y%m%d%H%M%S}{suffix}")
+
+
+def _url_request(url: str, method: str = "GET") -> Request:
+    return Request(
+        url,
+        method=method,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; tg-user-bot/1.0)",
+            "Accept": "*/*",
+        },
+    )
+
+
+def probe_media_url(url: str) -> tuple[bool, str]:
+    try:
+        with urlopen(_url_request(url, "HEAD"), timeout=20) as response:
+            final_url = response.geturl()
+            content_type = _content_type(response.headers)
+            content_disposition = response.headers.get("Content-Disposition") or ""
+            return _is_media_resource(content_type, final_url, content_disposition), final_url
+    except HTTPError as e:
+        if e.code not in {405, 403, 404, 501}:
+            raise
+    except URLError:
+        raise
+    except Exception:
+        raise
+
+    return True, url
+
+
+def download_media_url(url: str, download_dir: Path, progress=None) -> str | None:
+    should_try_get, final_url = probe_media_url(url)
+    if not should_try_get:
+        return None
+
+    target_path = None
+    try:
+        with urlopen(_url_request(final_url), timeout=30) as response:
+            response_url = response.geturl()
+            content_type = _content_type(response.headers)
+            content_disposition = response.headers.get("Content-Disposition") or ""
+            if not _is_media_resource(content_type, response_url, content_disposition):
+                return None
+
+            target_path = _target_file_path(download_dir, response_url, response.headers)
+            downloaded = 0
+            content_length = response.headers.get("Content-Length")
+            if progress and content_length and content_length.isdigit():
+                progress.thread_callback(0, int(content_length))
+            with target_path.open("wb") as f:
+                while True:
+                    chunk = response.read(1024 * 128)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress:
+                        progress.thread_callback(downloaded)
+    except Exception:
+        if target_path and target_path.exists():
+            target_path.unlink(missing_ok=True)
+        raise
+
+    return str(target_path) if target_path else None
+
+
+def download_first_media_url(
+    urls: list[str],
+    download_dir: Path,
+    progress=None,
+) -> tuple[str | None, str, str]:
+    if not urls:
+        return None, "未找到可检查的链接", ""
+
+    last_error = ""
+    checked_count = 0
+    for url in urls:
+        try:
+            checked_count += 1
+            if progress:
+                progress.thread_reset("正在下载链接媒体资源")
+            file_path = download_media_url(url, download_dir, progress)
+        except Exception as e:
+            last_error = str(e)
+            logger.warning("[Download] Failed checking url {}: {}", url, e)
+            continue
+        if file_path:
+            logger.info("[Download] Saved url media {} -> {}", url, file_path)
+            return file_path, "", url
+
+    if checked_count and last_error:
+        return None, f"链接检查失败: {last_error}", ""
+    if checked_count:
+        return None, "链接资源不是可下载的媒体资源", ""
+    return None, f"链接检查失败: {last_error}" if last_error else "未找到可下载的媒体链接", ""
+
+
 async def download_telegram_media_message(message) -> str | None:
     if not getattr(message, "media", None):
         return None
@@ -180,6 +416,61 @@ async def download_telegram_media_message(message) -> str | None:
     download_dir = await get_download_dir()
     target = _telegram_target_file_path(download_dir, message)
     return await message.download_media(file=str(target))
+
+
+async def download_telegram_message_link(url: str, progress=None) -> tuple[str | None, str, str]:
+    from bot.client import userbot
+
+    target = parse_telegram_message_link(url)
+    if not target:
+        return None, "不是 Telegram 消息链接", ""
+
+    chat, msg_id = target
+    try:
+        msg = await userbot.client.get_messages(chat, ids=msg_id)
+    except Exception as e:
+        logger.warning("[Download] Failed to fetch Telegram link chat={} msg={}: {}", chat, msg_id, e)
+        return None, f"无法读取消息链接: {e}", ""
+
+    if not msg:
+        return None, "消息链接对应的消息不存在或当前账号无权访问", ""
+    if not getattr(msg, "media", None):
+        return None, "消息链接对应的消息不是媒体资源", ""
+
+    try:
+        file_path = await download_telegram_media_message(msg)
+    except Exception as e:
+        logger.warning("[Download] Failed to download Telegram linked media chat={} msg={}: {}", chat, msg_id, e)
+        return None, f"消息链接媒体下载失败: {e}", ""
+
+    if not file_path:
+        return None, "消息链接媒体下载失败: Telegram 未返回文件路径", ""
+
+    logger.info("[Download] Saved linked Telegram media chat={} msg={} -> {}", chat, msg_id, file_path)
+    return file_path, "", url
+
+
+async def download_first_telegram_message_link(
+    urls: list[str],
+    progress=None,
+) -> tuple[str | None, str, str]:
+    last_reason = ""
+    checked_count = 0
+    for url in urls:
+        if not parse_telegram_message_link(url):
+            continue
+
+        checked_count += 1
+        if progress:
+            await progress.reset("正在下载 Telegram 消息链接媒体")
+        file_path, reason, source_url = await download_telegram_message_link(url, progress)
+        if file_path:
+            return file_path, "", source_url
+        last_reason = reason
+
+    if checked_count:
+        return None, last_reason or "未找到可下载的 Telegram 消息媒体", ""
+    return None, "", ""
 
 
 def _join_webdav_url(base_url: str, remote_path: str, filename: str) -> str:
@@ -284,3 +575,207 @@ async def finalize_download(local_file: str | Path) -> str:
     if not download_settings.keep_local:
         file_path.unlink(missing_ok=True)
     return target_url
+
+
+def telegram_source_url(chat_id, message_id: int) -> str:
+    return f"telegram://{chat_id}/{message_id}"
+
+
+def _now_cst() -> datetime:
+    return datetime.now(TZ_CST)
+
+
+def _duration_ms(started_at: datetime | None, completed_at: datetime) -> int:
+    if not started_at:
+        return 0
+    return max(int((completed_at - started_at).total_seconds() * 1000), 0)
+
+
+def _path_size(path: str | Path | None) -> int:
+    if not path:
+        return 0
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return 0
+
+
+def _path_mime(path: str | Path | None) -> str:
+    if not path:
+        return ""
+    guessed, _ = mimetypes.guess_type(str(path))
+    return guessed or ""
+
+
+async def create_media_download_record(
+    source_type: str,
+    trigger_type: str,
+    source_url: str = "",
+    source_chat: str = "",
+    source_message_id: int = 0,
+    status: str = "running",
+):
+    from database import crud
+    from database.engine import async_session
+
+    now = _now_cst()
+    async with async_session() as session:
+        item = await crud.create_media_download(
+            session,
+            source_type=source_type,
+            trigger_type=trigger_type,
+            source_url=source_url,
+            source_chat=source_chat,
+            source_message_id=source_message_id,
+            status=status,
+        )
+        if status == "running":
+            item = await crud.update_media_download(session, item.id, started_at=now, error="")
+        return item
+
+
+async def mark_media_download_completed(
+    download_id: int,
+    local_path: str | Path,
+    target_path: str,
+    file_size: int | None = None,
+    mime_type: str | None = None,
+    source_url: str | None = None,
+) -> None:
+    from database import crud
+    from database.engine import async_session
+
+    completed_at = _now_cst()
+    local_path_obj = Path(local_path)
+    download_settings = await get_download_settings()
+    async with async_session() as session:
+        item = await crud.get_media_download(session, download_id)
+        if not item:
+            return
+        values = {
+            "status": "completed",
+            "target_type": download_settings.target_type,
+            "target_path": target_path,
+            "local_path": str(local_path_obj),
+            "file_name": local_path_obj.name,
+            "mime_type": mime_type if mime_type is not None else _path_mime(local_path_obj),
+            "file_size": file_size if file_size is not None else _path_size(local_path_obj),
+            "error": "",
+            "completed_at": completed_at,
+            "duration_ms": _duration_ms(item.started_at, completed_at),
+        }
+        if source_url is not None:
+            values["source_url"] = source_url
+        await crud.update_media_download(session, download_id, **values)
+
+
+async def mark_media_download_failed(download_id: int, error: str) -> None:
+    from database import crud
+    from database.engine import async_session
+
+    completed_at = _now_cst()
+    async with async_session() as session:
+        item = await crud.get_media_download(session, download_id)
+        if not item:
+            return
+        await crud.update_media_download(
+            session,
+            download_id,
+            status="failed",
+            error=str(error)[:2000],
+            completed_at=completed_at,
+            duration_ms=_duration_ms(item.started_at, completed_at),
+        )
+
+
+async def queue_media_download_retry(download_id: int):
+    from database import crud
+    from database.engine import async_session
+
+    async with async_session() as session:
+        item = await crud.get_media_download(session, download_id)
+        if not item:
+            return None
+        if item.status in {"queued", "running"}:
+            return item
+        return await crud.update_media_download(
+            session,
+            download_id,
+            status="queued",
+            error="",
+            retry_count=item.retry_count + 1,
+            started_at=None,
+            completed_at=None,
+            duration_ms=0,
+        )
+
+
+def _source_chat_ref(value: str):
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+async def retry_media_download(download_id: int) -> None:
+    from bot.client import userbot
+    from database import crud
+    from database.engine import async_session
+
+    started_at = _now_cst()
+    async with async_session() as session:
+        item = await crud.get_media_download(session, download_id)
+        if not item:
+            return
+        await crud.update_media_download(
+            session,
+            download_id,
+            status="running",
+            started_at=started_at,
+            completed_at=None,
+            duration_ms=0,
+            error="",
+        )
+        source_type = item.source_type
+        source_url = item.source_url
+        source_chat = item.source_chat
+        source_message_id = item.source_message_id
+
+    local_path = ""
+    try:
+        if source_type == "telegram_message_link":
+            local_path, reason, _ = await download_telegram_message_link(source_url)
+            if not local_path:
+                raise RuntimeError(reason or "Telegram 消息链接未返回媒体文件")
+        elif source_type == "telegram_media":
+            chat_ref = _source_chat_ref(source_chat)
+            if chat_ref is None or not source_message_id:
+                raise RuntimeError("缺少 Telegram 来源会话或消息 ID")
+            msg = await userbot.client.get_messages(chat_ref, ids=source_message_id)
+            if not msg or not getattr(msg, "media", None):
+                raise RuntimeError("原消息不存在或不是媒体资源")
+            local_path = await download_telegram_media_message(msg) or ""
+            if not local_path:
+                raise RuntimeError("Telegram 未返回文件路径")
+        elif source_type == "http_url":
+            download_dir = await get_download_dir()
+            local_path = await asyncio.to_thread(download_media_url, source_url, download_dir, None) or ""
+            if not local_path:
+                raise RuntimeError("链接资源不是可下载的媒体资源")
+        else:
+            raise RuntimeError(f"不支持的资源来源: {source_type}")
+
+        file_size = _path_size(local_path)
+        mime_type = _path_mime(local_path)
+        target = await finalize_download(local_path)
+        await mark_media_download_completed(download_id, local_path, target, file_size=file_size, mime_type=mime_type)
+
+        logger.info(
+            "[Download] Retry completed id={} source={} size={} -> {}",
+            download_id, source_url or telegram_source_url(source_chat, source_message_id), file_size, target,
+        )
+    except Exception as e:
+        logger.warning("[Download] Retry failed id={}: {}", download_id, e)
+        await mark_media_download_failed(download_id, str(e))

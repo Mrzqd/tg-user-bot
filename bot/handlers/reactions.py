@@ -9,7 +9,31 @@ from loguru import logger
 from telethon import events
 
 from bot.client import userbot
-from bot.downloads import download_telegram_media_message, finalize_download, get_download_settings
+from bot.downloads import (
+    create_media_download_record,
+    download_telegram_media_message,
+    finalize_download,
+    get_download_settings,
+    mark_media_download_completed,
+    mark_media_download_failed,
+    telegram_source_url,
+)
+
+
+def _path_size(path) -> int:
+    from pathlib import Path
+
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return 0
+
+
+def _path_mime(path) -> str:
+    import mimetypes
+
+    guessed, _ = mimetypes.guess_type(str(path))
+    return guessed or ""
 
 
 def _reaction_emoji(reaction) -> str:
@@ -66,10 +90,29 @@ def register_reaction_handlers() -> None:
             if not msg or not getattr(msg, "media", None):
                 return
 
-            local_path = await download_telegram_media_message(msg)
+            record = await create_media_download_record(
+                source_type="telegram_media",
+                trigger_type="reaction",
+                source_url=telegram_source_url(getattr(msg, "chat_id", None) or getattr(chat, "id", ""), msg_id),
+                source_chat=str(getattr(msg, "chat_id", None) or getattr(chat, "id", "")),
+                source_message_id=msg_id,
+            )
+            try:
+                local_path = await download_telegram_media_message(msg)
+            except Exception as e:
+                await mark_media_download_failed(record.id, str(e))
+                raise
             if not local_path:
+                await mark_media_download_failed(record.id, "Telegram 未返回文件路径")
                 return
-            target = await finalize_download(local_path)
+            file_size = _path_size(local_path)
+            mime_type = _path_mime(local_path)
+            try:
+                target = await finalize_download(local_path)
+            except Exception as e:
+                await mark_media_download_failed(record.id, str(e))
+                raise
+            await mark_media_download_completed(record.id, local_path, target, file_size=file_size, mime_type=mime_type)
 
             chat_title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(getattr(chat, "id", ""))
             text = (

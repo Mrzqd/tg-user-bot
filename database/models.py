@@ -78,6 +78,32 @@ class MessageLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now_cst)
 
 
+class MediaDownload(Base):
+    """Media download tasks and results shown in the web console."""
+    __tablename__ = "media_downloads"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source_type: Mapped[str] = mapped_column(String(40), index=True, default="")
+    source_url: Mapped[str] = mapped_column(Text, default="")
+    source_chat: Mapped[str] = mapped_column(String(255), default="")
+    source_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    trigger_type: Mapped[str] = mapped_column(String(40), index=True, default="")
+    status: Mapped[str] = mapped_column(String(20), index=True, default="pending")
+    target_type: Mapped[str] = mapped_column(String(20), default="")
+    target_path: Mapped[str] = mapped_column(Text, default="")
+    local_path: Mapped[str] = mapped_column(Text, default="")
+    file_name: Mapped[str] = mapped_column(String(255), default="")
+    mime_type: Mapped[str] = mapped_column(String(120), default="")
+    file_size: Mapped[int] = mapped_column(BigInteger, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now_cst)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now_cst, onupdate=_now_cst)
+
+
 class AppSetting(Base):
     """Runtime key-value settings managed from the web console."""
     __tablename__ = "app_settings"

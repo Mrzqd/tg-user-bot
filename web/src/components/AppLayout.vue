@@ -36,6 +36,7 @@ const nav = [
   { to: '/groups', label: '监控群组', icon: '&#9782;' },
   { to: '/rules', label: '关键词规则', icon: '&#9881;' },
   { to: '/schedules', label: '定时任务', icon: '&#9200;' },
+  { to: '/downloads', label: '媒体资源', icon: '&#8681;' },
   { to: '/logs', label: '消息日志', icon: '&#9776;' },
   { to: '/settings', label: '系统设置', icon: '&#9881;' },
   { to: '/help', label: '命令帮助', icon: '&#10068;' },
