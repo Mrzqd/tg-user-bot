@@ -14,9 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY main.py config.py ./
+COPY api ./api
+COPY bot ./bot
+COPY database ./database
+COPY utils ./utils
 COPY --from=frontend /build/dist /app/web/dist
 
-RUN mkdir -p data logs sessions
+RUN mkdir -p data logs sessions downloads
 
 CMD ["python", "main.py"]
