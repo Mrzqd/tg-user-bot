@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import mimetypes
 import ssl
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin, urlparse
@@ -16,6 +18,8 @@ from urllib.request import (
 
 from loguru import logger
 
+TZ_CST = timezone(timedelta(hours=8))
+
 
 SETTING_TARGET_TYPE = "download.target_type"
 SETTING_LOCAL_PATH = "download.local_path"
@@ -25,6 +29,9 @@ SETTING_WEBDAV_USERNAME = "download.webdav_username"
 SETTING_WEBDAV_PASSWORD = "download.webdav_password"
 SETTING_WEBDAV_REMOTE_PATH = "download.webdav_remote_path"
 SETTING_WEBDAV_VERIFY_SSL = "download.webdav_verify_ssl"
+SETTING_REACTION_ENABLED = "reaction_download.enabled"
+SETTING_REACTION_EMOJI = "reaction_download.emoji"
+SETTING_REACTION_NOTIFY_CHAT_ID = "reaction_download.notify_chat_id"
 
 DOWNLOAD_SETTING_KEYS = [
     SETTING_TARGET_TYPE,
@@ -35,6 +42,9 @@ DOWNLOAD_SETTING_KEYS = [
     SETTING_WEBDAV_PASSWORD,
     SETTING_WEBDAV_REMOTE_PATH,
     SETTING_WEBDAV_VERIFY_SSL,
+    SETTING_REACTION_ENABLED,
+    SETTING_REACTION_EMOJI,
+    SETTING_REACTION_NOTIFY_CHAT_ID,
 ]
 
 
@@ -48,6 +58,9 @@ class DownloadSettings:
     webdav_password: str = ""
     webdav_remote_path: str = ""
     webdav_verify_ssl: bool = True
+    reaction_enabled: bool = False
+    reaction_emoji: str = "👍"
+    reaction_notify_chat_id: int = 0
 
 
 def _to_bool(value: str | bool | None, default: bool) -> bool:
@@ -88,6 +101,9 @@ async def get_download_settings() -> DownloadSettings:
         webdav_password=values.get(SETTING_WEBDAV_PASSWORD) or "",
         webdav_remote_path=values.get(SETTING_WEBDAV_REMOTE_PATH) or "",
         webdav_verify_ssl=_to_bool(values.get(SETTING_WEBDAV_VERIFY_SSL), True),
+        reaction_enabled=_to_bool(values.get(SETTING_REACTION_ENABLED), False),
+        reaction_emoji=values.get(SETTING_REACTION_EMOJI) or "👍",
+        reaction_notify_chat_id=int(values.get(SETTING_REACTION_NOTIFY_CHAT_ID) or 0),
     )
 
 
@@ -103,6 +119,9 @@ async def save_download_settings(new_settings: DownloadSettings) -> None:
         SETTING_WEBDAV_USERNAME: new_settings.webdav_username,
         SETTING_WEBDAV_REMOTE_PATH: new_settings.webdav_remote_path,
         SETTING_WEBDAV_VERIFY_SSL: "1" if new_settings.webdav_verify_ssl else "0",
+        SETTING_REACTION_ENABLED: "1" if new_settings.reaction_enabled else "0",
+        SETTING_REACTION_EMOJI: new_settings.reaction_emoji,
+        SETTING_REACTION_NOTIFY_CHAT_ID: str(new_settings.reaction_notify_chat_id),
     }
     values[SETTING_WEBDAV_PASSWORD] = new_settings.webdav_password
 
@@ -115,6 +134,52 @@ async def get_download_dir() -> Path:
     path = _resolve_local_path(current.local_path)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _clean_filename(filename: str) -> str:
+    cleaned = "".join("_" if ch in '\\/:*?"<>|' or ord(ch) < 32 else ch for ch in filename).strip(". ")
+    return cleaned[:180] or "download"
+
+
+def _message_media_filename(message) -> str:
+    media = getattr(message, "media", None)
+    document = getattr(media, "document", None)
+    if document:
+        for attr in getattr(document, "attributes", None) or []:
+            if type(attr).__name__ == "DocumentAttributeFilename" and getattr(attr, "file_name", ""):
+                return _clean_filename(attr.file_name)
+
+        mime_type = getattr(document, "mime_type", "") or ""
+        ext = mimetypes.guess_extension(mime_type) or ".bin"
+        return f"telegram_{message.chat_id}_{message.id}{ext}"
+
+    if getattr(media, "photo", None):
+        return f"telegram_{message.chat_id}_{message.id}.jpg"
+
+    return f"telegram_{message.chat_id}_{message.id}.bin"
+
+
+def _telegram_target_file_path(download_dir: Path, message) -> Path:
+    target = download_dir / _message_media_filename(message)
+    if not target.exists():
+        return target
+
+    stem = target.stem
+    suffix = target.suffix
+    for idx in range(1, 1000):
+        candidate = target.with_name(f"{stem}_{idx}{suffix}")
+        if not candidate.exists():
+            return candidate
+    return target.with_name(f"{stem}_{datetime.now(TZ_CST):%Y%m%d%H%M%S}{suffix}")
+
+
+async def download_telegram_media_message(message) -> str | None:
+    if not getattr(message, "media", None):
+        return None
+
+    download_dir = await get_download_dir()
+    target = _telegram_target_file_path(download_dir, message)
+    return await message.download_media(file=str(target))
 
 
 def _join_webdav_url(base_url: str, remote_path: str, filename: str) -> str:

@@ -21,6 +21,9 @@ async def get_download_config():
         webdav_remote_path=settings.webdav_remote_path,
         webdav_verify_ssl=settings.webdav_verify_ssl,
         has_webdav_password=bool(settings.webdav_password),
+        reaction_enabled=settings.reaction_enabled,
+        reaction_emoji=settings.reaction_emoji,
+        reaction_notify_chat_id=settings.reaction_notify_chat_id,
     )
 
 
@@ -43,6 +46,9 @@ async def update_download_config(body: DownloadSettingsIn):
         webdav_password=new_password,
         webdav_remote_path=body.webdav_remote_path.strip(),
         webdav_verify_ssl=body.webdav_verify_ssl,
+        reaction_enabled=body.reaction_enabled,
+        reaction_emoji=body.reaction_emoji.strip() or "👍",
+        reaction_notify_chat_id=body.reaction_notify_chat_id,
     )
     await save_download_settings(new_settings)
     return DownloadSettingsOut(
@@ -54,4 +60,7 @@ async def update_download_config(body: DownloadSettingsIn):
         webdav_remote_path=new_settings.webdav_remote_path,
         webdav_verify_ssl=new_settings.webdav_verify_ssl,
         has_webdav_password=bool(new_settings.webdav_password),
+        reaction_enabled=new_settings.reaction_enabled,
+        reaction_emoji=new_settings.reaction_emoji,
+        reaction_notify_chat_id=new_settings.reaction_notify_chat_id,
     )

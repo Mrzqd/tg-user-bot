@@ -96,6 +96,9 @@ class DownloadSettingsIn(BaseModel):
     webdav_password: str = ""
     webdav_remote_path: str = ""
     webdav_verify_ssl: bool = True
+    reaction_enabled: bool = False
+    reaction_emoji: str = "👍"
+    reaction_notify_chat_id: int = 0
 
 
 # ──────────────────────── Response models ────────────────────────
@@ -177,6 +180,9 @@ class DownloadSettingsOut(BaseModel):
     webdav_remote_path: str
     webdav_verify_ssl: bool
     has_webdav_password: bool
+    reaction_enabled: bool
+    reaction_emoji: str
+    reaction_notify_chat_id: int
 
 
 class WebLoginOut(BaseModel):
