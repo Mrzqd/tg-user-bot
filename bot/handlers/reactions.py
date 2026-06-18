@@ -13,15 +13,15 @@ from telethon import events
 
 from bot.client import userbot
 from bot.downloads import (
-    create_media_download_record,
-    finalize_download,
     get_download_settings,
     get_download_dir,
-    mark_media_download_completed,
-    mark_media_download_failed,
-    telegram_source_url,
 )
-from bot.handlers.commands import DownloadProgress, _download_telegram_media, _message_media_size
+from bot.handlers.commands import (
+    DownloadProgress,
+    _download_and_finish_telegram_messages,
+    _media_group_messages,
+    _message_media_size,
+)
 
 REACTION_CACHE_TTL = 12 * 3600
 REACTION_POLL_INTERVAL = 20
@@ -32,22 +32,6 @@ _last_reaction_counts: dict[tuple[str, int, str], int] = {}
 _processed_reactions: dict[tuple[str, int, str], float] = {}
 _inflight_reactions: set[tuple[str, int, str]] = set()
 _reaction_poll_task: asyncio.Task | None = None
-
-
-def _path_size(path) -> int:
-    from pathlib import Path
-
-    try:
-        return Path(path).stat().st_size
-    except OSError:
-        return 0
-
-
-def _path_mime(path) -> str:
-    import mimetypes
-
-    guessed, _ = mimetypes.guess_type(str(path))
-    return guessed or ""
 
 
 def _reaction_emoji(reaction) -> str:
@@ -201,16 +185,20 @@ async def _create_download_progress(chat_id: int, msg) -> tuple[object | None, D
         return None, None
 
 
-async def _notify_download_success(chat_id: int, target: str, message=None) -> None:
-    await _edit_or_send(chat_id, f"下载完成: `{_display_path(target)}`", message)
+async def _notify_download_success(chat_id: int, targets: list[str], message=None) -> None:
+    if len(targets) == 1:
+        await _edit_or_send(chat_id, f"下载完成: `{_display_path(targets[0])}`", message)
+        return
+    lines = [f"下载完成，共 {len(targets)} 个资源："]
+    lines.extend(f"- `{_display_path(target)}`" for target in targets)
+    await _edit_or_send(chat_id, "\n".join(lines), message)
 
 
-async def _notify_finalize_failed(chat_id: int, error: Exception, local_path: str, message=None) -> None:
-    await _edit_or_send(
-        chat_id,
-        f"下载完成，但保存到目标失败: `{error}`\n本地文件: `{_display_path(local_path)}`",
-        message,
-    )
+async def _notify_download_partial(chat_id: int, targets: list[str], errors: list[str], message=None) -> None:
+    lines = [f"部分下载完成: {len(targets)} 成功，{len(errors)} 失败"]
+    lines.extend(f"- `{_display_path(target)}`" for target in targets)
+    lines.extend(f"- {error}" for error in errors[:3])
+    await _edit_or_send(chat_id, "\n".join(lines), message)
 
 
 async def _notify_download_failed(chat_id: int, error: Exception | str, message=None) -> None:
@@ -231,52 +219,47 @@ async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) ->
             logger.debug("[ReactionDownload] msg={} is not downloadable media, skipped", msg_id)
             return
 
-        record = await create_media_download_record(
-            source_type="telegram_media",
-            trigger_type="reaction",
-            source_url=telegram_source_url(source_chat, msg_id),
-            source_chat=source_chat,
-            source_message_id=msg_id,
-        )
         progress_message = None
         progress = None
         try:
             progress_message, progress = await _create_download_progress(config.reaction_notify_chat_id, msg)
             download_dir = await get_download_dir()
-            local_path = await _download_telegram_media(msg, download_dir, progress)
+            group_messages = await _media_group_messages(msg)
+            targets, errors = await _download_and_finish_telegram_messages(
+                group_messages,
+                download_dir,
+                "reaction",
+                progress,
+            )
         except Exception as e:
-            await mark_media_download_failed(record.id, str(e))
             await _notify_download_failed(config.reaction_notify_chat_id, e, progress_message)
             logger.warning("[ReactionDownload] Download failed msg={}: {}", msg_id, e)
             return
-        if not local_path:
-            await mark_media_download_failed(record.id, "Telegram 未返回文件路径")
-            await _notify_download_failed(config.reaction_notify_chat_id, "Telegram 未返回文件路径", progress_message)
+
+        if not targets:
+            await _notify_download_failed(
+                config.reaction_notify_chat_id,
+                errors[0] if errors else "Telegram 未返回文件路径",
+                progress_message,
+            )
             return
-        if progress:
-            await progress.finish()
-        file_size = _path_size(local_path)
-        mime_type = _path_mime(local_path)
-        if progress:
-            await progress.reset("正在保存到下载目标", file_size)
-        elif progress_message:
-            await _edit_or_send(config.reaction_notify_chat_id, "正在保存到下载目标...", progress_message)
-        try:
-            target = await finalize_download(local_path, progress)
-        except Exception as e:
-            await mark_media_download_failed(record.id, str(e))
-            await _notify_finalize_failed(config.reaction_notify_chat_id, e, local_path, progress_message)
-            logger.warning("[ReactionDownload] Finalize failed msg={}: {}", msg_id, e)
+
+        if errors:
+            await _notify_download_partial(config.reaction_notify_chat_id, targets, errors, progress_message)
             return
-        await mark_media_download_completed(record.id, local_path, target, file_size=file_size, mime_type=mime_type)
 
         chat_title = getattr(chat, "title", None) or getattr(chat, "username", None) or source_chat
-        await _notify_download_success(config.reaction_notify_chat_id, target, progress_message)
+        await _notify_download_success(config.reaction_notify_chat_id, targets, progress_message)
         count = _message_reaction_count(msg, config.reaction_emoji.strip() or "👍")
         if count is not None:
             _last_reaction_counts[key] = count
         _processed_reactions[key] = time.monotonic()
-        logger.info("[ReactionDownload] msg={} chat={} reason={} -> {}", msg_id, chat_title, reason, target)
+        for item in group_messages:
+            item_chat = str(getattr(item, "chat_id", None) or source_chat)
+            item_id = int(getattr(item, "id", 0) or 0)
+            if item_id:
+                _processed_reactions[_message_reaction_key(item_chat, item_id, config.reaction_emoji.strip() or "👍")] = time.monotonic()
+        logger.info("[ReactionDownload] msg={} chat={} reason={} count={}", msg_id, chat_title, reason, len(targets))
     finally:
         _inflight_reactions.discard(key)
 

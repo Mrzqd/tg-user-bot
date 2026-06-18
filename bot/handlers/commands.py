@@ -39,7 +39,9 @@ from database import crud
 
 TZ_CST = timezone(timedelta(hours=8))
 MIN_PARALLEL_DOWNLOAD_SIZE = 1024 * 1024
-PROGRESS_UPDATE_INTERVAL = 1.5
+PROGRESS_UPDATE_INTERVAL = 10.0
+PROGRESS_FORCE_UPDATE_INTERVAL = 5.0
+MEDIA_GROUP_SCAN_LIMIT = 20
 
 
 def _format_bytes(value: int | float | None) -> str:
@@ -63,6 +65,9 @@ class DownloadProgress:
         self.current = 0
         self.started_at = time.monotonic()
         self.last_update_at = 0.0
+        self.flood_wait_until = 0.0
+        self.last_text = ""
+        self.pending_update: asyncio.Task | None = None
         self.lock = asyncio.Lock()
         self.loop = asyncio.get_running_loop()
 
@@ -73,7 +78,7 @@ class DownloadProgress:
         self.current = int(current or 0)
         if total:
             self.total = int(total)
-        self.loop.create_task(self.update())
+        self._request_update()
 
     def thread_callback(self, current: int, total: int | None = None) -> None:
         self.loop.call_soon_threadsafe(self._schedule_update, int(current or 0), total)
@@ -85,14 +90,14 @@ class DownloadProgress:
         self.current = current
         if total:
             self.total = int(total)
-        self.loop.create_task(self.update())
+        self._request_update()
 
     def _schedule_reset(self, label: str | None, total: int | None) -> None:
         self.loop.create_task(self.reset(label, total))
 
     async def add(self, delta: int) -> None:
         self.current += int(delta or 0)
-        await self.update()
+        self._request_update()
 
     async def reset(self, label: str | None = None, total: int | None = None) -> None:
         if label:
@@ -101,31 +106,66 @@ class DownloadProgress:
         self.current = 0
         self.started_at = time.monotonic()
         self.last_update_at = 0.0
+        self.last_text = ""
         await self.update(force=True)
+
+    def _request_update(self) -> None:
+        now = time.monotonic()
+        if now < self.flood_wait_until:
+            return
+        if now - self.last_update_at < PROGRESS_UPDATE_INTERVAL:
+            return
+        if self.pending_update and not self.pending_update.done():
+            return
+        self.pending_update = self.loop.create_task(self.update())
 
     async def update(self, force: bool = False) -> None:
         now = time.monotonic()
-        if not force and now - self.last_update_at < PROGRESS_UPDATE_INTERVAL:
+        if now < self.flood_wait_until:
+            return
+        min_interval = PROGRESS_FORCE_UPDATE_INTERVAL if force else PROGRESS_UPDATE_INTERVAL
+        if self.last_update_at and now - self.last_update_at < min_interval:
             return
 
         async with self.lock:
             now = time.monotonic()
-            if not force and now - self.last_update_at < PROGRESS_UPDATE_INTERVAL:
+            if now < self.flood_wait_until:
                 return
-            self.last_update_at = now
+            min_interval = PROGRESS_FORCE_UPDATE_INTERVAL if force else PROGRESS_UPDATE_INTERVAL
+            if self.last_update_at and now - self.last_update_at < min_interval:
+                return
 
             elapsed = max(now - self.started_at, 0.001)
             speed = self.current / elapsed
             text = self._render(speed)
+            if text == self.last_text:
+                return
             try:
                 await self.event.edit(text)
+                self.last_update_at = now
+                self.last_text = text
             except Exception as e:
+                wait_seconds = self._flood_wait_seconds(e)
+                if wait_seconds:
+                    self.flood_wait_until = time.monotonic() + wait_seconds
+                    logger.warning("[Download] Progress update paused for {}s: {}", wait_seconds, e)
+                    return
                 logger.debug("[Download] Failed to update progress: {}", e)
 
     async def finish(self) -> None:
         if self.total:
             self.current = max(self.current, self.total)
         await self.update(force=True)
+
+    @staticmethod
+    def _flood_wait_seconds(error: Exception) -> int | None:
+        seconds = getattr(error, "seconds", None)
+        if isinstance(seconds, int) and seconds > 0:
+            return seconds
+        match = re.search(r"A wait of (\d+) seconds is required", str(error))
+        if match:
+            return int(match.group(1))
+        return None
 
     def _render(self, speed: float) -> str:
         if self.total:
@@ -152,7 +192,12 @@ def _get_topic_id(event: events.NewMessage.Event) -> int:
 
 async def _reply(event, text: str) -> None:
     """Edit the outgoing command message, then schedule auto-delete if configured."""
-    await event.edit(text)
+    try:
+        await event.edit(text)
+    except Exception as e:
+        logger.warning("[Download] Failed to edit command reply, sending fallback message: {}", e)
+        await userbot.send_message(event.chat_id, text)
+        return
     sec = settings.cmd_delete_after
     if sec and sec > 0:
         loop = asyncio.get_running_loop()
@@ -335,6 +380,121 @@ async def _download_telegram_media(
     )
 
 
+def _is_downloadable_telegram_media(message) -> bool:
+    return bool(getattr(message, "media", None) and not _is_webpage_preview_media(message))
+
+
+async def _media_group_messages(message) -> list:
+    if not _is_downloadable_telegram_media(message):
+        return []
+
+    grouped_id = getattr(message, "grouped_id", None)
+    if not grouped_id:
+        return [message]
+
+    chat_id = getattr(message, "chat_id", None)
+    if chat_id is None:
+        return [message]
+
+    min_id = max(int(message.id) - MEDIA_GROUP_SCAN_LIMIT, 0)
+    max_id = int(message.id) + MEDIA_GROUP_SCAN_LIMIT
+    messages = []
+    async for item in userbot.client.iter_messages(chat_id, min_id=min_id, max_id=max_id, reverse=True):
+        if getattr(item, "grouped_id", None) != grouped_id:
+            continue
+        if not _is_downloadable_telegram_media(item):
+            continue
+        messages.append(item)
+
+    if not any(getattr(item, "id", None) == getattr(message, "id", None) for item in messages):
+        messages.append(message)
+    messages.sort(key=lambda item: int(getattr(item, "id", 0) or 0))
+    return messages
+
+
+async def _finish_media_file(
+    file_path: str,
+    progress: DownloadProgress | None = None,
+    download_id: int | None = None,
+    source_url: str | None = None,
+) -> tuple[str | None, str]:
+    if progress:
+        await progress.finish()
+    file_size = _path_size(file_path)
+    mime_type = _path_mime(file_path)
+    if progress:
+        await progress.reset("正在保存到下载目标", file_size)
+    try:
+        target = await finalize_download(file_path, progress)
+    except Exception as e:
+        logger.warning("[Download] Finalize failed for {}: {}", file_path, e)
+        if download_id:
+            await mark_media_download_failed(download_id, str(e))
+        return None, f"下载完成，但保存到目标失败: `{e}`\n本地文件: `{_display_path(file_path)}`"
+
+    if download_id:
+        await mark_media_download_completed(
+            download_id,
+            file_path,
+            target,
+            file_size=file_size,
+            mime_type=mime_type,
+            source_url=source_url,
+        )
+    return target, ""
+
+
+async def _download_and_finish_telegram_message(
+    message,
+    download_dir: Path,
+    trigger_type: str,
+    progress: DownloadProgress | None = None,
+    source_url: str | None = None,
+) -> tuple[str | None, str]:
+    source_chat = str(getattr(message, "chat_id", ""))
+    msg_id = int(getattr(message, "id", 0) or 0)
+    record = await create_media_download_record(
+        source_type="telegram_media",
+        trigger_type=trigger_type,
+        source_url=source_url or telegram_source_url(source_chat, msg_id),
+        source_chat=source_chat,
+        source_message_id=msg_id,
+    )
+    try:
+        file_path = await _download_telegram_media(message, download_dir, progress)
+    except Exception as e:
+        await mark_media_download_failed(record.id, str(e))
+        logger.warning("[Download] Failed to download Telegram media chat={} msg={}: {}", source_chat, msg_id, e)
+        return None, f"下载失败: `{e}`"
+
+    if not file_path:
+        error = "Telegram 未返回文件路径"
+        await mark_media_download_failed(record.id, error)
+        return None, f"下载失败: `{error}`"
+
+    return await _finish_media_file(file_path, progress, record.id, source_url)
+
+
+async def _download_and_finish_telegram_messages(
+    messages: list,
+    download_dir: Path,
+    trigger_type: str,
+    progress: DownloadProgress | None = None,
+) -> tuple[list[str], list[str]]:
+    targets = []
+    errors = []
+    total = len(messages)
+    for idx, message in enumerate(messages, 1):
+        if progress:
+            await progress.reset(f"正在下载 Telegram 媒体资源 ({idx}/{total})", _message_media_size(message))
+        target, error = await _download_and_finish_telegram_message(message, download_dir, trigger_type, progress)
+        if target:
+            targets.append(target)
+        if error:
+            errors.append(error)
+    return targets, errors
+
+
 async def _download_telegram_message_media(
     chat,
     msg_id: int,
@@ -440,31 +600,29 @@ async def _finish_download(
     download_id: int | None = None,
     source_url: str | None = None,
 ) -> None:
-    if progress:
-        await progress.finish()
-    file_size = _path_size(file_path)
-    mime_type = _path_mime(file_path)
-    if progress:
-        await progress.reset("正在保存到下载目标", file_size)
-    else:
+    if not progress:
         await event.edit("正在保存到下载目标...")
-    try:
-        target = await finalize_download(file_path, progress)
-    except Exception as e:
-        logger.warning("[Download] Finalize failed for {}: {}", file_path, e)
-        if download_id:
-            await mark_media_download_failed(download_id, str(e))
-        return await _reply(event, f"下载完成，但保存到目标失败: `{e}`\n本地文件: `{_display_path(file_path)}`")
-    if download_id:
-        await mark_media_download_completed(
-            download_id,
-            file_path,
-            target,
-            file_size=file_size,
-            mime_type=mime_type,
-            source_url=source_url,
-        )
+    target, error = await _finish_media_file(file_path, progress, download_id, source_url)
+    if error:
+        return await _reply(event, error)
     await _reply(event, f"下载完成: `{_display_path(target)}`")
+
+
+async def _reply_download_summary(event, targets: list[str], errors: list[str]) -> None:
+    if targets and not errors:
+        if len(targets) == 1:
+            return await _reply(event, f"下载完成: `{_display_path(targets[0])}`")
+        lines = [f"下载完成，共 {len(targets)} 个资源："]
+        lines.extend(f"- `{_display_path(target)}`" for target in targets)
+        return await _reply(event, "\n".join(lines))
+
+    if targets and errors:
+        lines = [f"部分下载完成: {len(targets)} 成功，{len(errors)} 失败"]
+        lines.extend(f"- `{_display_path(target)}`" for target in targets)
+        lines.extend(f"- {error}" for error in errors[:3])
+        return await _reply(event, "\n".join(lines))
+
+    return await _reply(event, errors[0] if errors else "未找到可下载的媒体资源")
 
 
 def _is_webpage_preview_media(message) -> bool:
@@ -557,44 +715,66 @@ def register_command_handlers() -> None:
         if has_telegram_message_link:
             progress = DownloadProgress(event, "正在下载 Telegram 消息链接媒体")
             await progress.start()
-            first_link = next((url for url in urls if parse_telegram_message_link(url)), "")
-            record = await create_media_download_record(
-                source_type="telegram_message_link",
-                trigger_type="command",
-                source_url=first_link,
-                source_chat=str(event.chat_id),
-                source_message_id=reply.id,
-            )
-            file_path, telegram_link_reason, source_url = await _download_first_telegram_message_link(urls, download_dir, progress)
-            if file_path:
-                return await _finish_download(event, file_path, progress, record.id, source_url)
-            await mark_media_download_failed(record.id, telegram_link_reason or "未找到可下载的 Telegram 消息媒体")
+            targets = []
+            errors = []
+            seen_media = set()
+            telegram_links = [url for url in urls if parse_telegram_message_link(url)]
+            for idx, url in enumerate(telegram_links, 1):
+                target = parse_telegram_message_link(url)
+                if not target:
+                    continue
+                chat, msg_id = target
+                if progress:
+                    await progress.reset(f"正在下载 Telegram 消息链接媒体 ({idx}/{len(telegram_links)})")
+                try:
+                    linked_msg = await userbot.client.get_messages(chat, ids=msg_id)
+                except Exception as e:
+                    errors.append(f"无法读取消息链接: `{e}`")
+                    continue
+                if not linked_msg or not _is_downloadable_telegram_media(linked_msg):
+                    errors.append("消息链接对应的消息不是媒体资源")
+                    continue
+                group_messages = await _media_group_messages(linked_msg)
+                unique_messages = []
+                for item in group_messages:
+                    media_key = (
+                        str(getattr(item, "chat_id", chat)),
+                        int(getattr(item, "id", 0) or 0),
+                    )
+                    if media_key in seen_media:
+                        continue
+                    seen_media.add(media_key)
+                    unique_messages.append(item)
+                if not unique_messages:
+                    continue
+                group_targets, group_errors = await _download_and_finish_telegram_messages(
+                    unique_messages,
+                    download_dir,
+                    "command",
+                    progress,
+                )
+                targets.extend(group_targets)
+                errors.extend(group_errors)
+            if targets:
+                return await _reply_download_summary(event, targets, errors)
+            telegram_link_reason = errors[0] if errors else "未找到可下载的 Telegram 消息媒体"
         else:
             telegram_link_reason = ""
 
         telegram_error = ""
-        if getattr(reply, "media", None) and not _is_webpage_preview_media(reply):
+        if _is_downloadable_telegram_media(reply):
             progress = DownloadProgress(event, "正在下载 Telegram 媒体资源", _message_media_size(reply))
             await progress.start()
-            record = await create_media_download_record(
-                source_type="telegram_media",
-                trigger_type="command",
-                source_url=telegram_source_url(event.chat_id, reply.id),
-                source_chat=str(event.chat_id),
-                source_message_id=reply.id,
+            group_messages = await _media_group_messages(reply)
+            targets, errors = await _download_and_finish_telegram_messages(
+                group_messages,
+                download_dir,
+                "command",
+                progress,
             )
-            try:
-                file_path = await _download_telegram_media(reply, download_dir, progress)
-            except Exception as e:
-                telegram_error = str(e)
-                await mark_media_download_failed(record.id, telegram_error)
-                logger.warning("[Download] Failed to download Telegram media chat={} msg={}: {}", event.chat_id, reply.id, e)
-            else:
-                if file_path:
-                    logger.info("[Download] Saved media chat={} msg={} -> {}", event.chat_id, reply.id, file_path)
-                    return await _finish_download(event, file_path, progress, record.id)
-                telegram_error = "Telegram 未返回文件路径"
-                await mark_media_download_failed(record.id, telegram_error)
+            if targets:
+                return await _reply_download_summary(event, targets, errors)
+            telegram_error = errors[0] if errors else "Telegram 未返回文件路径"
 
         if not urls:
             if telegram_error:
@@ -607,24 +787,36 @@ def register_command_handlers() -> None:
 
         progress = DownloadProgress(event, "正在下载链接媒体资源")
         await progress.start()
-        record = await create_media_download_record(
-            source_type="http_url",
-            trigger_type="command",
-            source_url=http_urls[0],
-            source_chat=str(event.chat_id),
-            source_message_id=reply.id,
-        )
-        try:
-            file_path, reason, source_url = await asyncio.to_thread(download_first_media_url, http_urls, download_dir, progress)
-        except Exception as e:
-            logger.exception("[Download] Failed to download linked media chat={} msg={}", event.chat_id, reply.id)
-            await mark_media_download_failed(record.id, str(e))
-            return await _reply(event, f"链接下载失败: `{e}`")
+        targets = []
+        errors = []
+        for idx, url in enumerate(http_urls, 1):
+            if progress:
+                await progress.reset(f"正在下载链接媒体资源 ({idx}/{len(http_urls)})")
+            record = await create_media_download_record(
+                source_type="http_url",
+                trigger_type="command",
+                source_url=url,
+                source_chat=str(event.chat_id),
+                source_message_id=reply.id,
+            )
+            try:
+                file_path, reason, source_url = await asyncio.to_thread(download_first_media_url, [url], download_dir, progress)
+            except Exception as e:
+                logger.exception("[Download] Failed to download linked media chat={} msg={}", event.chat_id, reply.id)
+                await mark_media_download_failed(record.id, str(e))
+                errors.append(f"链接下载失败: `{e}`")
+                continue
 
-        if not file_path:
-            await mark_media_download_failed(record.id, telegram_link_reason or reason)
-            return await _reply(event, telegram_link_reason or reason)
-        await _finish_download(event, file_path, progress, record.id, source_url)
+            if not file_path:
+                await mark_media_download_failed(record.id, telegram_link_reason or reason)
+                errors.append(telegram_link_reason or reason)
+                continue
+            target, error = await _finish_media_file(file_path, progress, record.id, source_url)
+            if target:
+                targets.append(target)
+            if error:
+                errors.append(error)
+        await _reply_download_summary(event, targets, errors)
 
     # ── Rules ────────────────────────────────────────────────
 
