@@ -104,6 +104,81 @@ class ReactionMatchingTest(unittest.TestCase):
         self.assertTrue(matched)
         self.assertEqual(reason, "reaction count increased 1->2")
 
+    def test_message_reaction_key_normalizes_chat_id(self):
+        self.assertEqual(
+            reactions._message_reaction_key(1001, 10, "👍"),
+            ("chat:1001", 10, "👍"),
+        )
+        self.assertEqual(
+            reactions._message_reaction_key("-1001001", 10, "👍"),
+            ("chat:-1001001", 10, "👍"),
+        )
+
+
+class ReactionPollingTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        reactions._last_reaction_counts.clear()
+        reactions._processed_reactions.clear()
+        reactions._inflight_reactions.clear()
+
+    async def test_iter_reaction_dialogs_uses_all_visible_dialog_entities(self):
+        dialogs = [
+            SimpleNamespace(id=1001, entity=SimpleNamespace(id=1001, title="group-a")),
+            SimpleNamespace(id=1002, entity=SimpleNamespace(id=1002, title="group-b")),
+            SimpleNamespace(id=1001, entity=SimpleNamespace(id=1001, title="duplicate")),
+            SimpleNamespace(id=1003, entity=None),
+        ]
+
+        class FakeClient:
+            async def iter_dialogs(self, limit=None):
+                for dialog in dialogs:
+                    yield dialog
+
+        original = getattr(reactions.userbot, "_client", None)
+        reactions.userbot._client = FakeClient()
+        try:
+            found = [chat async for chat in reactions._iter_reaction_dialogs()]
+        finally:
+            reactions.userbot._client = original
+
+        self.assertEqual([chat.id for chat in found], [1001, 1002])
+
+    async def test_poll_builds_baseline_before_downloading(self):
+        chat = SimpleNamespace(id=1001, title="group-a")
+        message = SimpleNamespace(
+            id=10,
+            chat_id=1001,
+            media=SimpleNamespace(),
+            reactions=SimpleNamespace(
+                results=[SimpleNamespace(reaction=SimpleNamespace(emoticon="👍"), count=1)],
+            ),
+        )
+        config = SimpleNamespace(reaction_emoji="👍", reaction_notify_chat_id=2001)
+        processed: list[str] = []
+
+        class FakeClient:
+            async def iter_messages(self, target, limit=None):
+                yield message
+
+        async def fake_process(chat_arg, msg_arg, msg_id_arg, config_arg, reason_arg):
+            processed.append(reason_arg)
+
+        original_client = getattr(reactions.userbot, "_client", None)
+        original_process = reactions._process_reacted_media
+        reactions.userbot._client = FakeClient()
+        reactions._process_reacted_media = fake_process
+        try:
+            await reactions._poll_chat_reactions(chat, config)
+            self.assertEqual(processed, [])
+
+            message.reactions.results[0].count = 2
+            await reactions._poll_chat_reactions(chat, config)
+        finally:
+            reactions.userbot._client = original_client
+            reactions._process_reacted_media = original_process
+
+        self.assertEqual(processed, ["poll reaction count increased 1->2"])
+
 
 if __name__ == "__main__":
     unittest.main()

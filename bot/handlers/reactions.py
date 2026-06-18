@@ -5,6 +5,7 @@ then pushes the result to a configured notification chat.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 
 from loguru import logger
@@ -22,10 +23,14 @@ from bot.downloads import (
 )
 
 REACTION_CACHE_TTL = 12 * 3600
+REACTION_POLL_INTERVAL = 20
+REACTION_DIALOG_LIMIT = None
+REACTION_POLL_LIMIT = 40
 
 _last_reaction_counts: dict[tuple[str, int, str], int] = {}
 _processed_reactions: dict[tuple[str, int, str], float] = {}
 _inflight_reactions: set[tuple[str, int, str]] = set()
+_reaction_poll_task: asyncio.Task | None = None
 
 
 def _path_size(path) -> int:
@@ -68,14 +73,23 @@ def _iter_old_reactions(update):
 
 
 def _reaction_count(update, emoji: str) -> int | None:
+    return _reaction_count_from_items(_iter_reaction_counts(update), emoji)
+
+
+def _reaction_count_from_items(items, emoji: str) -> int | None:
     total = 0
     matched = False
-    for item in _iter_reaction_counts(update):
+    for item in items or []:
         if _reaction_emoji(item) != emoji:
             continue
         matched = True
         total += int(getattr(item, "count", 0) or 0)
     return total if matched else None
+
+
+def _message_reaction_count(message, emoji: str) -> int | None:
+    reactions = getattr(message, "reactions", None)
+    return _reaction_count_from_items(getattr(reactions, "results", None) or [], emoji)
 
 
 def _update_msg_id(update) -> int | None:
@@ -96,6 +110,20 @@ def _peer_cache_key(update) -> str:
 
 def _reaction_key(update, msg_id: int, emoji: str) -> tuple[str, int, str]:
     return (_peer_cache_key(update), msg_id, emoji)
+
+
+def _normalize_chat_id(value) -> str:
+    try:
+        chat_id = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if chat_id < 0:
+        return str(chat_id)
+    return str(chat_id)
+
+
+def _message_reaction_key(chat_id: str, msg_id: int, emoji: str) -> tuple[str, int, str]:
+    return (f"chat:{_normalize_chat_id(chat_id)}", msg_id, emoji)
 
 
 def _prune_reaction_cache(now: float) -> None:
@@ -138,7 +166,171 @@ async def _update_chat(update):
     return await userbot.client.get_entity(peer)
 
 
+def _is_downloadable_media_message(message) -> bool:
+    media = getattr(message, "media", None)
+    if not media:
+        return False
+    return type(media).__name__ != "MessageMediaWebPage" and getattr(media, "webpage", None) is None
+
+
+def _display_path(path: str) -> str:
+    if path.startswith(("http://", "https://")):
+        return path
+    return str(path)
+
+
+async def _notify_download_success(chat_id: int, target: str) -> None:
+    await userbot.send_message(chat_id, f"下载完成: `{_display_path(target)}`")
+
+
+async def _notify_finalize_failed(chat_id: int, error: Exception, local_path: str) -> None:
+    await userbot.send_message(
+        chat_id,
+        f"下载完成，但保存到目标失败: `{error}`\n本地文件: `{_display_path(local_path)}`",
+    )
+
+
+async def _notify_download_failed(chat_id: int, error: Exception | str) -> None:
+    await userbot.send_message(chat_id, f"下载失败: `{error}`")
+
+
+async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) -> None:
+    source_chat = str(getattr(msg, "chat_id", None) or getattr(chat, "id", ""))
+    key = _message_reaction_key(source_chat, msg_id, config.reaction_emoji.strip() or "👍")
+
+    if key in _processed_reactions or key in _inflight_reactions:
+        logger.debug("[ReactionDownload] duplicate media skipped msg={} reason={}", msg_id, reason)
+        return
+    _inflight_reactions.add(key)
+
+    try:
+        if not _is_downloadable_media_message(msg):
+            logger.debug("[ReactionDownload] msg={} is not downloadable media, skipped", msg_id)
+            return
+
+        record = await create_media_download_record(
+            source_type="telegram_media",
+            trigger_type="reaction",
+            source_url=telegram_source_url(source_chat, msg_id),
+            source_chat=source_chat,
+            source_message_id=msg_id,
+        )
+        try:
+            local_path = await download_telegram_media_message(msg)
+        except Exception as e:
+            await mark_media_download_failed(record.id, str(e))
+            await _notify_download_failed(config.reaction_notify_chat_id, e)
+            logger.warning("[ReactionDownload] Download failed msg={}: {}", msg_id, e)
+            return
+        if not local_path:
+            await mark_media_download_failed(record.id, "Telegram 未返回文件路径")
+            await _notify_download_failed(config.reaction_notify_chat_id, "Telegram 未返回文件路径")
+            return
+        file_size = _path_size(local_path)
+        mime_type = _path_mime(local_path)
+        try:
+            target = await finalize_download(local_path)
+        except Exception as e:
+            await mark_media_download_failed(record.id, str(e))
+            await _notify_finalize_failed(config.reaction_notify_chat_id, e, local_path)
+            logger.warning("[ReactionDownload] Finalize failed msg={}: {}", msg_id, e)
+            return
+        await mark_media_download_completed(record.id, local_path, target, file_size=file_size, mime_type=mime_type)
+
+        chat_title = getattr(chat, "title", None) or getattr(chat, "username", None) or source_chat
+        await _notify_download_success(config.reaction_notify_chat_id, target)
+        count = _message_reaction_count(msg, config.reaction_emoji.strip() or "👍")
+        if count is not None:
+            _last_reaction_counts[key] = count
+        _processed_reactions[key] = time.monotonic()
+        logger.info("[ReactionDownload] msg={} chat={} reason={} -> {}", msg_id, chat_title, reason, target)
+    finally:
+        _inflight_reactions.discard(key)
+
+
+async def _poll_chat_reactions(chat, config) -> None:
+    wanted = config.reaction_emoji.strip() or "👍"
+    chat_id = getattr(chat, "id", chat)
+    chat_key = f"chat:{chat_id}"
+
+    try:
+        async for msg in userbot.client.iter_messages(chat, limit=REACTION_POLL_LIMIT):
+            if not _is_downloadable_media_message(msg):
+                continue
+
+            msg_id = int(getattr(msg, "id", 0) or 0)
+            if not msg_id:
+                continue
+
+            source_chat = str(getattr(msg, "chat_id", None) or chat_id)
+            key = _message_reaction_key(source_chat, msg_id, wanted)
+            current_count = _message_reaction_count(msg, wanted)
+            if current_count is None:
+                continue
+
+            previous_count = _last_reaction_counts.get(key)
+            _last_reaction_counts[key] = current_count
+            if current_count <= 0:
+                continue
+
+            if previous_count is None:
+                logger.debug(
+                    "[ReactionDownload] poll baseline chat={} msg={} count={}",
+                    chat_key,
+                    msg_id,
+                    current_count,
+                )
+                continue
+            if current_count > previous_count:
+                reason = f"poll reaction count increased {previous_count}->{current_count}"
+            else:
+                continue
+
+            logger.info("[ReactionDownload] poll matched chat={} msg={} reason={}", chat_key, msg_id, reason)
+            await _process_reacted_media(chat, msg, msg_id, config, reason)
+    except Exception as e:
+        logger.warning("[ReactionDownload] poll failed chat={}: {}", chat_id, e)
+
+
+async def _iter_reaction_dialogs():
+    seen = set()
+    async for dialog in userbot.client.iter_dialogs(limit=REACTION_DIALOG_LIMIT):
+        entity = getattr(dialog, "entity", None)
+        chat_id = getattr(dialog, "id", None) or getattr(entity, "id", None)
+        if entity is None or chat_id is None:
+            continue
+        key = _normalize_chat_id(chat_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield entity
+
+
+async def _reaction_poll_loop() -> None:
+    logger.info(
+        "Reaction polling started (interval={}s, dialogs={}, messages_per_dialog={})",
+        REACTION_POLL_INTERVAL,
+        REACTION_DIALOG_LIMIT or "all",
+        REACTION_POLL_LIMIT,
+    )
+    while True:
+        await asyncio.sleep(REACTION_POLL_INTERVAL)
+        try:
+            config = await get_download_settings()
+            if not config.reaction_enabled or not config.reaction_notify_chat_id:
+                continue
+
+            async for chat in _iter_reaction_dialogs():
+                await _poll_chat_reactions(chat, config)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("[ReactionDownload] poll loop failed: {}", e)
+
+
 def register_reaction_handlers() -> None:
+    global _reaction_poll_task
+
     client = userbot.client
 
     @client.on(events.Raw)
@@ -162,11 +354,6 @@ def register_reaction_handlers() -> None:
 
         now = time.monotonic()
         _prune_reaction_cache(now)
-        key = _reaction_key(update, msg_id, wanted)
-        if key in _processed_reactions or key in _inflight_reactions:
-            logger.debug("[ReactionDownload] duplicate reaction skipped msg={} reason={}", msg_id, reason)
-            return
-        _inflight_reactions.add(key)
 
         try:
             logger.info("[ReactionDownload] matched emoji={} msg={} reason={}", wanted, msg_id, reason)
@@ -174,51 +361,15 @@ def register_reaction_handlers() -> None:
             if chat is None:
                 return
             msg = await userbot.client.get_messages(chat, ids=msg_id)
-            if not msg or not getattr(msg, "media", None):
+            if not msg:
                 logger.debug("[ReactionDownload] msg={} is not media, skipped", msg_id)
                 return
-
-            record = await create_media_download_record(
-                source_type="telegram_media",
-                trigger_type="reaction",
-                source_url=telegram_source_url(getattr(msg, "chat_id", None) or getattr(chat, "id", ""), msg_id),
-                source_chat=str(getattr(msg, "chat_id", None) or getattr(chat, "id", "")),
-                source_message_id=msg_id,
-            )
-            try:
-                local_path = await download_telegram_media_message(msg)
-            except Exception as e:
-                await mark_media_download_failed(record.id, str(e))
-                raise
-            if not local_path:
-                await mark_media_download_failed(record.id, "Telegram 未返回文件路径")
-                return
-            file_size = _path_size(local_path)
-            mime_type = _path_mime(local_path)
-            try:
-                target = await finalize_download(local_path)
-            except Exception as e:
-                await mark_media_download_failed(record.id, str(e))
-                raise
-            await mark_media_download_completed(record.id, local_path, target, file_size=file_size, mime_type=mime_type)
-
-            chat_title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(getattr(chat, "id", ""))
-            text = (
-                f"已下载点赞资源\n"
-                f"来源: {chat_title}\n"
-                f"消息ID: `{msg_id}`\n"
-                f"保存到: `{target}`"
-            )
-            await userbot.send_message(config.reaction_notify_chat_id, text)
-            _processed_reactions[key] = time.monotonic()
-            logger.info("[ReactionDownload] msg={} chat={} -> {}", msg_id, chat_title, target)
+            await _process_reacted_media(chat, msg, msg_id, config, reason)
         except Exception as e:
             logger.exception("[ReactionDownload] Failed to process reaction update: {}", e)
-            try:
-                await userbot.send_message(config.reaction_notify_chat_id, f"点赞资源下载失败: `{e}`")
-            except Exception:
-                pass
-        finally:
-            _inflight_reactions.discard(key)
+            await _notify_download_failed(config.reaction_notify_chat_id, e)
+
+    if _reaction_poll_task is None or _reaction_poll_task.done():
+        _reaction_poll_task = asyncio.create_task(_reaction_poll_loop())
 
     logger.info("Reaction handlers registered")
