@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  userbot:
+    build: .
+    container_name: tg-userbot
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${API_PORT:-8080}:8080"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./sessions:/app/sessions
+      - ./downloads:/app/downloads
+    stdin_open: true
+    tty: true
