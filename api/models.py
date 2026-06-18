@@ -88,7 +88,7 @@ class TelegramPasswordIn(BaseModel):
 
 
 class DownloadSettingsIn(BaseModel):
-    target_type: str = Field("local", description="local | webdav")
+    target_type: str = Field("local", description="local | webdav | s3")
     local_path: str = ""
     keep_local: bool = True
     webdav_url: str = ""
@@ -96,6 +96,15 @@ class DownloadSettingsIn(BaseModel):
     webdav_password: str = ""
     webdav_remote_path: str = ""
     webdav_verify_ssl: bool = True
+    s3_endpoint_url: str = ""
+    s3_region: str = ""
+    s3_bucket: str = ""
+    s3_access_key_id: str = ""
+    s3_secret_access_key: str = ""
+    s3_prefix: str = ""
+    s3_addressing_style: str = "auto"
+    s3_multipart_chunk_mb: int = Field(16, ge=5, le=512)
+    s3_max_concurrency: int = Field(8, ge=1, le=64)
     reaction_enabled: bool = False
     reaction_emoji: str = "👍"
     reaction_notify_chat_id: int = 0
@@ -180,6 +189,15 @@ class DownloadSettingsOut(BaseModel):
     webdav_remote_path: str
     webdav_verify_ssl: bool
     has_webdav_password: bool
+    s3_endpoint_url: str
+    s3_region: str
+    s3_bucket: str
+    s3_access_key_id: str
+    s3_prefix: str
+    s3_addressing_style: str
+    s3_multipart_chunk_mb: int
+    s3_max_concurrency: int
+    has_s3_secret_access_key: bool
     reaction_enabled: bool
     reaction_emoji: str
     reaction_notify_chat_id: int

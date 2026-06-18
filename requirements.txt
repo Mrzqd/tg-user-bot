@@ -12,3 +12,4 @@ cryptography==44.0.0
 PySocks==1.7.1
 python-socks[asyncio]==2.7.1
 loguru==0.7.3
+boto3==1.35.99

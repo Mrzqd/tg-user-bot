@@ -6,6 +6,7 @@ import http.client
 import mimetypes
 import re
 import ssl
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -46,6 +47,15 @@ SETTING_WEBDAV_USERNAME = "download.webdav_username"
 SETTING_WEBDAV_PASSWORD = "download.webdav_password"
 SETTING_WEBDAV_REMOTE_PATH = "download.webdav_remote_path"
 SETTING_WEBDAV_VERIFY_SSL = "download.webdav_verify_ssl"
+SETTING_S3_ENDPOINT_URL = "download.s3_endpoint_url"
+SETTING_S3_REGION = "download.s3_region"
+SETTING_S3_BUCKET = "download.s3_bucket"
+SETTING_S3_ACCESS_KEY_ID = "download.s3_access_key_id"
+SETTING_S3_SECRET_ACCESS_KEY = "download.s3_secret_access_key"
+SETTING_S3_PREFIX = "download.s3_prefix"
+SETTING_S3_ADDRESSING_STYLE = "download.s3_addressing_style"
+SETTING_S3_MULTIPART_CHUNK_MB = "download.s3_multipart_chunk_mb"
+SETTING_S3_MAX_CONCURRENCY = "download.s3_max_concurrency"
 SETTING_REACTION_ENABLED = "reaction_download.enabled"
 SETTING_REACTION_EMOJI = "reaction_download.emoji"
 SETTING_REACTION_NOTIFY_CHAT_ID = "reaction_download.notify_chat_id"
@@ -60,6 +70,15 @@ DOWNLOAD_SETTING_KEYS = [
     SETTING_WEBDAV_PASSWORD,
     SETTING_WEBDAV_REMOTE_PATH,
     SETTING_WEBDAV_VERIFY_SSL,
+    SETTING_S3_ENDPOINT_URL,
+    SETTING_S3_REGION,
+    SETTING_S3_BUCKET,
+    SETTING_S3_ACCESS_KEY_ID,
+    SETTING_S3_SECRET_ACCESS_KEY,
+    SETTING_S3_PREFIX,
+    SETTING_S3_ADDRESSING_STYLE,
+    SETTING_S3_MULTIPART_CHUNK_MB,
+    SETTING_S3_MAX_CONCURRENCY,
     SETTING_REACTION_ENABLED,
     SETTING_REACTION_EMOJI,
     SETTING_REACTION_NOTIFY_CHAT_ID,
@@ -76,6 +95,15 @@ class DownloadSettings:
     webdav_password: str = ""
     webdav_remote_path: str = ""
     webdav_verify_ssl: bool = True
+    s3_endpoint_url: str = ""
+    s3_region: str = ""
+    s3_bucket: str = ""
+    s3_access_key_id: str = ""
+    s3_secret_access_key: str = ""
+    s3_prefix: str = ""
+    s3_addressing_style: str = "auto"
+    s3_multipart_chunk_mb: int = 16
+    s3_max_concurrency: int = 8
     reaction_enabled: bool = False
     reaction_emoji: str = "👍"
     reaction_notify_chat_id: int = 0
@@ -153,7 +181,7 @@ async def get_download_settings() -> DownloadSettings:
         values = await crud.get_settings(session, DOWNLOAD_SETTING_KEYS)
 
     target_type = values.get(SETTING_TARGET_TYPE) or "local"
-    if target_type not in {"local", "webdav"}:
+    if target_type not in {"local", "webdav", "s3"}:
         target_type = "local"
 
     return DownloadSettings(
@@ -165,6 +193,15 @@ async def get_download_settings() -> DownloadSettings:
         webdav_password=values.get(SETTING_WEBDAV_PASSWORD) or "",
         webdav_remote_path=values.get(SETTING_WEBDAV_REMOTE_PATH) or "",
         webdav_verify_ssl=_to_bool(values.get(SETTING_WEBDAV_VERIFY_SSL), True),
+        s3_endpoint_url=values.get(SETTING_S3_ENDPOINT_URL) or "",
+        s3_region=values.get(SETTING_S3_REGION) or "",
+        s3_bucket=values.get(SETTING_S3_BUCKET) or "",
+        s3_access_key_id=values.get(SETTING_S3_ACCESS_KEY_ID) or "",
+        s3_secret_access_key=values.get(SETTING_S3_SECRET_ACCESS_KEY) or "",
+        s3_prefix=values.get(SETTING_S3_PREFIX) or "",
+        s3_addressing_style=values.get(SETTING_S3_ADDRESSING_STYLE) or "auto",
+        s3_multipart_chunk_mb=int(values.get(SETTING_S3_MULTIPART_CHUNK_MB) or 16),
+        s3_max_concurrency=int(values.get(SETTING_S3_MAX_CONCURRENCY) or 8),
         reaction_enabled=_to_bool(values.get(SETTING_REACTION_ENABLED), False),
         reaction_emoji=values.get(SETTING_REACTION_EMOJI) or "👍",
         reaction_notify_chat_id=int(values.get(SETTING_REACTION_NOTIFY_CHAT_ID) or 0),
@@ -183,11 +220,20 @@ async def save_download_settings(new_settings: DownloadSettings) -> None:
         SETTING_WEBDAV_USERNAME: new_settings.webdav_username,
         SETTING_WEBDAV_REMOTE_PATH: new_settings.webdav_remote_path,
         SETTING_WEBDAV_VERIFY_SSL: "1" if new_settings.webdav_verify_ssl else "0",
+        SETTING_S3_ENDPOINT_URL: new_settings.s3_endpoint_url,
+        SETTING_S3_REGION: new_settings.s3_region,
+        SETTING_S3_BUCKET: new_settings.s3_bucket,
+        SETTING_S3_ACCESS_KEY_ID: new_settings.s3_access_key_id,
+        SETTING_S3_PREFIX: new_settings.s3_prefix,
+        SETTING_S3_ADDRESSING_STYLE: new_settings.s3_addressing_style,
+        SETTING_S3_MULTIPART_CHUNK_MB: str(new_settings.s3_multipart_chunk_mb),
+        SETTING_S3_MAX_CONCURRENCY: str(new_settings.s3_max_concurrency),
         SETTING_REACTION_ENABLED: "1" if new_settings.reaction_enabled else "0",
         SETTING_REACTION_EMOJI: new_settings.reaction_emoji,
         SETTING_REACTION_NOTIFY_CHAT_ID: str(new_settings.reaction_notify_chat_id),
     }
     values[SETTING_WEBDAV_PASSWORD] = new_settings.webdav_password
+    values[SETTING_S3_SECRET_ACCESS_KEY] = new_settings.s3_secret_access_key
 
     async with async_session() as session:
         await crud.set_settings(session, values)
@@ -621,15 +667,103 @@ def _upload_webdav_file(local_file: Path, download_settings: DownloadSettings, p
     return target_url
 
 
+def _join_s3_key(prefix: str, filename: str) -> str:
+    parts = [part.strip("/") for part in (prefix or "").split("/") if part.strip("/")]
+    parts.append(_clean_filename(filename))
+    return "/".join(parts)
+
+
+def _s3_object_url(download_settings: DownloadSettings, key: str) -> str:
+    endpoint = download_settings.s3_endpoint_url.rstrip("/")
+    if endpoint:
+        return f"{endpoint}/{quote(download_settings.s3_bucket)}/{quote(key, safe='/')}"
+    region = download_settings.s3_region or "us-east-1"
+    return f"https://{download_settings.s3_bucket}.s3.{region}.amazonaws.com/{quote(key, safe='/')}"
+
+
+def _upload_s3_file(local_file: Path, download_settings: DownloadSettings, progress_callback=None) -> str:
+    if not download_settings.s3_bucket:
+        raise ValueError("S3 Bucket 不能为空")
+    if not download_settings.s3_access_key_id:
+        raise ValueError("S3 Access Key 不能为空")
+    if not download_settings.s3_secret_access_key:
+        raise ValueError("S3 Secret Key 不能为空")
+
+    try:
+        import boto3
+        from boto3.s3.transfer import S3Transfer, TransferConfig
+        from botocore.client import Config
+    except ImportError as e:
+        raise RuntimeError("缺少 boto3 依赖，请重新安装 requirements.txt 或重建镜像") from e
+
+    addressing_style = download_settings.s3_addressing_style
+    if addressing_style not in {"auto", "path", "virtual"}:
+        addressing_style = "auto"
+    chunk_size = max(5, min(int(download_settings.s3_multipart_chunk_mb or 16), 512)) * 1024 * 1024
+    concurrency = max(1, min(int(download_settings.s3_max_concurrency or 8), 64))
+    key = _join_s3_key(download_settings.s3_prefix, local_file.name)
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=download_settings.s3_endpoint_url or None,
+        region_name=download_settings.s3_region or None,
+        aws_access_key_id=download_settings.s3_access_key_id,
+        aws_secret_access_key=download_settings.s3_secret_access_key,
+        config=Config(s3={"addressing_style": addressing_style}),
+    )
+    transfer = S3Transfer(
+        client,
+        TransferConfig(
+            multipart_threshold=chunk_size,
+            multipart_chunksize=chunk_size,
+            max_concurrency=concurrency,
+            use_threads=concurrency > 1,
+        ),
+    )
+
+    uploaded = 0
+    progress_lock = threading.Lock()
+
+    def on_progress(delta: int) -> None:
+        nonlocal uploaded
+        with progress_lock:
+            uploaded += int(delta or 0)
+            current = uploaded
+        if progress_callback:
+            progress_callback(current)
+
+    extra_args = {}
+    content_type = _path_mime(local_file)
+    if content_type:
+        extra_args["ContentType"] = content_type
+    transfer.upload_file(
+        str(local_file),
+        download_settings.s3_bucket,
+        key,
+        extra_args=extra_args or None,
+        callback=on_progress,
+    )
+    logger.info(
+        "[S3] Uploaded {} -> bucket={} key={} chunk={} concurrency={}",
+        local_file, download_settings.s3_bucket, key, chunk_size, concurrency,
+    )
+    return _s3_object_url(download_settings, key)
+
+
 async def finalize_download(local_file: str | Path, progress=None) -> str:
     file_path = Path(local_file)
     download_settings = await get_download_settings()
-    if download_settings.target_type != "webdav":
+    if download_settings.target_type == "local":
         return str(file_path)
 
     progress_callback = getattr(progress, "thread_callback", None) if progress else None
-    target_url = await asyncio.to_thread(_upload_webdav_file, file_path, download_settings, progress_callback)
-    logger.info("[WebDAV] Uploaded {} -> {}", file_path, target_url)
+    if download_settings.target_type == "webdav":
+        target_url = await asyncio.to_thread(_upload_webdav_file, file_path, download_settings, progress_callback)
+        logger.info("[WebDAV] Uploaded {} -> {}", file_path, target_url)
+    elif download_settings.target_type == "s3":
+        target_url = await asyncio.to_thread(_upload_s3_file, file_path, download_settings, progress_callback)
+    else:
+        return str(file_path)
     if not download_settings.keep_local:
         file_path.unlink(missing_ok=True)
     return target_url
