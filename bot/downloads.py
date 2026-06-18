@@ -588,6 +588,12 @@ def _now_cst() -> datetime:
 def _duration_ms(started_at: datetime | None, completed_at: datetime) -> int:
     if not started_at:
         return 0
+
+    if started_at.tzinfo is not None:
+        started_at = started_at.astimezone(TZ_CST).replace(tzinfo=None)
+    if completed_at.tzinfo is not None:
+        completed_at = completed_at.astimezone(TZ_CST).replace(tzinfo=None)
+
     return max(int((completed_at - started_at).total_seconds() * 1000), 0)
 
 
