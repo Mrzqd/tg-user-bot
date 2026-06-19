@@ -64,6 +64,15 @@
             <span>校验 SSL 证书</span>
           </label>
         </div>
+
+        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <button class="btn-ghost w-fit" :disabled="testingWebDav" @click="testWebDav">
+            {{ testingWebDav ? '测试中...' : '测试 WebDAV' }}
+          </button>
+          <div v-if="webDavTestMessage" :class="webDavTestOk ? 'text-accent' : 'text-err'" class="text-xs">
+            {{ webDavTestMessage }}
+          </div>
+        </div>
       </div>
 
       <div v-if="form.target_type === 's3'" class="space-y-4">
@@ -165,6 +174,9 @@ import { inject, onMounted, reactive, ref } from 'vue'
 import { api } from '../api.js'
 
 const saving = ref(false)
+const testingWebDav = ref(false)
+const webDavTestMessage = ref('')
+const webDavTestOk = ref(false)
 const hasPassword = ref(false)
 const hasS3Secret = ref(false)
 const toast = inject('toast')
@@ -236,6 +248,23 @@ async function save() {
     toast(e.message, 'error')
   } finally {
     saving.value = false
+  }
+}
+
+async function testWebDav() {
+  testingWebDav.value = true
+  webDavTestMessage.value = ''
+  webDavTestOk.value = false
+  try {
+    const data = await api.testWebDavSettings(form)
+    webDavTestOk.value = true
+    webDavTestMessage.value = data.target_url ? `${data.message}: ${data.target_url}` : data.message
+    toast('WebDAV 测试成功')
+  } catch (e) {
+    webDavTestMessage.value = e.message
+    toast(e.message, 'error')
+  } finally {
+    testingWebDav.value = false
   }
 }
 

@@ -203,6 +203,12 @@ class DownloadSettingsOut(BaseModel):
     reaction_notify_chat_id: int
 
 
+class WebDavTestOut(BaseModel):
+    ok: bool
+    message: str
+    target_url: str = ""
+
+
 class MediaDownloadOut(BaseModel):
     id: int
     source_type: str

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.deps import verify_api_key
-from api.models import DownloadSettingsIn, DownloadSettingsOut
-from bot.downloads import DownloadSettings, get_download_settings, save_download_settings
+from api.models import DownloadSettingsIn, DownloadSettingsOut, WebDavTestOut
+from bot.downloads import DownloadSettings, get_download_settings, save_download_settings, test_webdav_settings
 
 router = APIRouter(prefix="/settings", tags=["Settings"], dependencies=[Depends(verify_api_key)])
 
@@ -85,3 +87,27 @@ async def update_download_config(body: DownloadSettingsIn):
     )
     await save_download_settings(new_settings)
     return _download_settings_out(new_settings)
+
+
+@router.post("/download/webdav-test", response_model=WebDavTestOut)
+async def test_webdav_config(body: DownloadSettingsIn):
+    if not body.webdav_url.strip():
+        raise HTTPException(status_code=400, detail="WebDAV URL 不能为空")
+
+    current = await get_download_settings()
+    new_password = body.webdav_password if body.webdav_password else current.webdav_password
+    settings = DownloadSettings(
+        target_type="webdav",
+        local_path=body.local_path.strip(),
+        keep_local=body.keep_local,
+        webdav_url=body.webdav_url.strip(),
+        webdav_username=body.webdav_username.strip(),
+        webdav_password=new_password,
+        webdav_remote_path=body.webdav_remote_path.strip(),
+        webdav_verify_ssl=body.webdav_verify_ssl,
+    )
+    try:
+        target_url = await asyncio.to_thread(test_webdav_settings, settings)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"WebDAV 测试失败: {e}")
+    return WebDavTestOut(ok=True, message="WebDAV 测试成功", target_url=target_url)

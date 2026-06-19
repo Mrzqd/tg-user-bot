@@ -15,6 +15,7 @@ from bot.downloads import (
     _add_webdav_auth,
     _ensure_webdav_collections,
     _join_webdav_url,
+    test_webdav_settings,
     _upload_webdav_file,
 )
 
@@ -30,13 +31,16 @@ class FakeOpener:
     def open(self, req: Request, timeout: int = 0):
         self.requests.append(req)
         if req.get_method() == "HEAD":
-            if req.full_url in self.existing_urls:
+            if req.full_url in self.existing_urls or ".tg-userbot-webdav-test-" in req.full_url:
                 return object()
             raise HTTPError(req.full_url, 404, "not found", {}, None)
         if req.get_method() == "PUT":
             self.put_attempts += 1
             if self.fail_first_put and self.put_attempts == 1:
                 raise BrokenPipeError("simulated broken pipe")
+            if isinstance(req.data, (bytes, bytearray)):
+                self.put_body_chunks.append(len(req.data))
+                return object()
             while True:
                 chunk = req.data.read(WEBDAV_UPLOAD_BLOCK_SIZE * 2)
                 if not chunk:
@@ -79,6 +83,29 @@ class WebDavDownloadUnitTest(unittest.TestCase):
         self.assertEqual(methods, ["MKCOL", "MKCOL"])
         self.assertEqual(urls, ["http://example.test/dav/local/", "http://example.test/dav/local/tg/"])
         self.assertTrue(all(req.get_header("Authorization") for req in opener.requests))
+
+    def test_webdav_settings_writes_checks_and_cleans_test_file(self) -> None:
+        opener = FakeOpener()
+        settings = DownloadSettings(
+            webdav_url="http://example.test/dav",
+            webdav_username="user",
+            webdav_password="pass",
+            webdav_remote_path="/local/tg",
+        )
+        import bot.downloads as downloads
+
+        original = downloads._make_webdav_opener
+        downloads._make_webdav_opener = lambda _: opener
+        try:
+            target = test_webdav_settings(settings)
+        finally:
+            downloads._make_webdav_opener = original
+
+        methods = [req.get_method() for req in opener.requests]
+        self.assertTrue(target.startswith("http://example.test/dav/local/tg/.tg-userbot-webdav-test-"))
+        self.assertIn("PUT", methods)
+        self.assertIn("HEAD", methods)
+        self.assertIn("DELETE", methods)
 
     def test_upload_retries_put_after_broken_pipe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

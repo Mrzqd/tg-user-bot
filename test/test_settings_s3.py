@@ -13,6 +13,38 @@ except ModuleNotFoundError as exc:
 
 
 class S3SettingsRouteTest(unittest.IsolatedAsyncioTestCase):
+    async def test_webdav_test_reuses_saved_password_when_body_password_empty(self) -> None:
+        tested: list[DownloadSettings] = []
+
+        async def fake_get_download_settings():
+            return DownloadSettings(webdav_password="old-pass")
+
+        def fake_test_webdav_settings(new_settings):
+            tested.append(new_settings)
+            return "http://example.test/dav/local/tg/.tg-userbot-webdav-test-1.txt"
+
+        original_get = settings_route.get_download_settings
+        original_test = settings_route.test_webdav_settings
+        settings_route.get_download_settings = fake_get_download_settings
+        settings_route.test_webdav_settings = fake_test_webdav_settings
+        try:
+            result = await settings_route.test_webdav_config(
+                DownloadSettingsIn(
+                    target_type="webdav",
+                    webdav_url="http://example.test/dav",
+                    webdav_username="user",
+                    webdav_password="",
+                    webdav_remote_path="/local/tg",
+                )
+            )
+        finally:
+            settings_route.get_download_settings = original_get
+            settings_route.test_webdav_settings = original_test
+
+        self.assertEqual(tested[0].webdav_password, "old-pass")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.message, "WebDAV 测试成功")
+
     async def test_s3_secret_kept_when_body_secret_empty(self) -> None:
         saved: list[DownloadSettings] = []
 

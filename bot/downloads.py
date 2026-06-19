@@ -658,6 +658,48 @@ def _put_webdav_file(
         opener.open(req, timeout=300)
 
 
+def test_webdav_settings(download_settings: DownloadSettings) -> str:
+    if not download_settings.webdav_url:
+        raise ValueError("WebDAV URL 未配置")
+    if urlparse(download_settings.webdav_url).scheme not in {"http", "https"}:
+        raise ValueError("WebDAV URL 必须以 http:// 或 https:// 开头")
+
+    opener = _make_webdav_opener(download_settings)
+    _ensure_webdav_collections(opener, download_settings)
+
+    filename = f".tg-userbot-webdav-test-{int(time.time())}.txt"
+    target_url = _join_webdav_url(
+        download_settings.webdav_url,
+        download_settings.webdav_remote_path,
+        filename,
+    )
+    data = b"tg-userbot webdav test\n"
+    req = Request(target_url, data=data, method="PUT")
+    _add_webdav_auth(req, download_settings)
+    req.add_header("Content-Type", "text/plain; charset=utf-8")
+    req.add_header("Content-Length", str(len(data)))
+    opener.open(req, timeout=60)
+
+    exists_req = Request(target_url, method="HEAD")
+    _add_webdav_auth(exists_req, download_settings)
+    try:
+        opener.open(exists_req, timeout=60)
+    except HTTPError as e:
+        if e.code not in {405, 501}:
+            raise
+        logger.debug("[WebDAV] Test HEAD unsupported for {}: {}", target_url, e)
+
+    delete_req = Request(target_url, method="DELETE")
+    _add_webdav_auth(delete_req, download_settings)
+    try:
+        opener.open(delete_req, timeout=60)
+    except HTTPError as e:
+        if e.code not in {404, 405, 501}:
+            raise
+        logger.debug("[WebDAV] Test cleanup skipped for {}: {}", target_url, e)
+    return target_url
+
+
 def _upload_webdav_file(local_file: Path, download_settings: DownloadSettings, progress_callback=None) -> str:
     if not download_settings.webdav_url:
         raise ValueError("WebDAV URL 未配置")
