@@ -31,6 +31,7 @@ from bot.downloads import (
     get_download_dir,
     mark_media_download_completed,
     mark_media_download_failed,
+    _clean_filename,
     _existing_file_matches,
     parse_telegram_message_link,
     telegram_source_url,

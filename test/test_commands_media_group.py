@@ -11,6 +11,21 @@ except ModuleNotFoundError as exc:
 
 
 class MediaGroupDownloadTest(unittest.IsolatedAsyncioTestCase):
+    def test_message_media_filename_cleans_document_filename(self):
+        attr = commands.DocumentAttributeFilename("a:b?.mp4")
+        message = SimpleNamespace(
+            id=10,
+            chat_id=1001,
+            media=SimpleNamespace(
+                document=SimpleNamespace(
+                    mime_type="video/mp4",
+                    attributes=[attr],
+                ),
+            ),
+        )
+
+        self.assertEqual(commands._message_media_filename(message), "a_b_.mp4")
+
     async def test_media_group_messages_collects_grouped_media(self):
         base = SimpleNamespace(id=10, chat_id=1001, grouped_id=55, media=SimpleNamespace())
         same_before = SimpleNamespace(id=9, chat_id=1001, grouped_id=55, media=SimpleNamespace())
