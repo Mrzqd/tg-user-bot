@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from urllib.error import HTTPError
 from urllib.request import Request
 
 from bot.downloads import (
@@ -19,14 +20,19 @@ from bot.downloads import (
 
 
 class FakeOpener:
-    def __init__(self, fail_first_put: bool = False) -> None:
+    def __init__(self, fail_first_put: bool = False, existing_urls: set[str] | None = None) -> None:
         self.fail_first_put = fail_first_put
+        self.existing_urls = existing_urls or set()
         self.requests: list[Request] = []
         self.put_attempts = 0
         self.put_body_chunks: list[int] = []
 
     def open(self, req: Request, timeout: int = 0):
         self.requests.append(req)
+        if req.get_method() == "HEAD":
+            if req.full_url in self.existing_urls:
+                return object()
+            raise HTTPError(req.full_url, 404, "not found", {}, None)
         if req.get_method() == "PUT":
             self.put_attempts += 1
             if self.fail_first_put and self.put_attempts == 1:
@@ -125,6 +131,34 @@ class WebDavDownloadUnitTest(unittest.TestCase):
         self.assertEqual(len(put_requests), 1)
         self.assertEqual(opener.put_body_chunks, [WEBDAV_UPLOAD_BLOCK_SIZE, 123])
         self.assertEqual(progress_values, [WEBDAV_UPLOAD_BLOCK_SIZE, WEBDAV_UPLOAD_BLOCK_SIZE + 123])
+
+    def test_upload_skips_when_remote_file_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.bin"
+            path.write_bytes(b"a" * 128)
+            settings = DownloadSettings(
+                webdav_url="http://example.test/dav",
+                webdav_username="user",
+                webdav_password="pass",
+                webdav_remote_path="/local/tg",
+            )
+            target_url = "http://example.test/dav/local/tg/sample.bin"
+
+            opener = FakeOpener(existing_urls={target_url})
+            import bot.downloads as downloads
+
+            original = downloads._make_webdav_opener
+            downloads._make_webdav_opener = lambda _: opener
+            try:
+                target = _upload_webdav_file(path, settings)
+            finally:
+                downloads._make_webdav_opener = original
+
+        methods = [req.get_method() for req in opener.requests]
+        self.assertEqual(target, target_url)
+        self.assertTrue(getattr(target, "existed", False))
+        self.assertIn("HEAD", methods)
+        self.assertNotIn("PUT", methods)
 
 
 class WebDavSmokeTest(unittest.TestCase):

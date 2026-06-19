@@ -19,6 +19,7 @@ from bot.downloads import (
 from bot.handlers.commands import (
     DownloadProgress,
     _download_and_finish_telegram_messages,
+    _download_success_text,
     _media_group_messages,
     _message_media_size,
 )
@@ -187,16 +188,16 @@ async def _create_download_progress(chat_id: int, msg) -> tuple[object | None, D
 
 async def _notify_download_success(chat_id: int, targets: list[str], message=None) -> None:
     if len(targets) == 1:
-        await _edit_or_send(chat_id, f"下载完成: `{_display_path(targets[0])}`", message)
+        await _edit_or_send(chat_id, _download_success_text(targets[0]), message)
         return
     lines = [f"下载完成，共 {len(targets)} 个资源："]
-    lines.extend(f"- `{_display_path(target)}`" for target in targets)
+    lines.extend(f"- {_download_success_text(target)}" for target in targets)
     await _edit_or_send(chat_id, "\n".join(lines), message)
 
 
 async def _notify_download_partial(chat_id: int, targets: list[str], errors: list[str], message=None) -> None:
     lines = [f"部分下载完成: {len(targets)} 成功，{len(errors)} 失败"]
-    lines.extend(f"- `{_display_path(target)}`" for target in targets)
+    lines.extend(f"- {_download_success_text(target)}" for target in targets)
     lines.extend(f"- {error}" for error in errors[:3])
     await _edit_or_send(chat_id, "\n".join(lines), message)
 

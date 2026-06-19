@@ -13,7 +13,7 @@ router = APIRouter(prefix="/groups", tags=["Groups"], dependencies=[Depends(veri
 @router.get("", response_model=list[GroupOut])
 async def list_groups():
     async with async_session() as session:
-        groups = await crud.get_active_groups(session)
+        groups = await crud.get_all_groups(session)
     return [GroupOut.model_validate(g) for g in groups]
 
 
@@ -22,8 +22,8 @@ async def add_group(body: GroupIn):
     async with async_session() as session:
         try:
             group = await crud.add_group(session, chat_id=body.chat_id, title=body.title)
-        except Exception:
-            raise HTTPException(400, "Group already exists or database error")
+        except crud.GroupAlreadyMonitoredError:
+            raise HTTPException(409, "Group already monitored")
     return GroupOut.model_validate(group)
 
 

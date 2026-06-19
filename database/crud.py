@@ -11,6 +11,10 @@ from database.models import AppSetting, MonitoredGroup, KeywordRule, ScheduledMe
 
 # ──────────────────────── MonitoredGroup ────────────────────────
 
+class GroupAlreadyMonitoredError(Exception):
+    """Raised when a monitored group is already active."""
+
+
 async def get_active_groups(session: AsyncSession) -> Sequence[MonitoredGroup]:
     result = await session.execute(
         select(MonitoredGroup).where(MonitoredGroup.is_active == True)  # noqa: E712
@@ -18,7 +22,28 @@ async def get_active_groups(session: AsyncSession) -> Sequence[MonitoredGroup]:
     return result.scalars().all()
 
 
+async def get_all_groups(session: AsyncSession) -> Sequence[MonitoredGroup]:
+    result = await session.execute(
+        select(MonitoredGroup).order_by(MonitoredGroup.id.desc())
+    )
+    return result.scalars().all()
+
+
 async def add_group(session: AsyncSession, chat_id: int, title: str = "") -> MonitoredGroup:
+    result = await session.execute(
+        select(MonitoredGroup).where(MonitoredGroup.chat_id == chat_id)
+    )
+    existing = result.scalar_one_or_none()
+    if existing:
+        if existing.is_active:
+            raise GroupAlreadyMonitoredError(str(chat_id))
+        existing.title = title or existing.title
+        existing.is_active = True
+        existing.updated_at = _now_cst()
+        await session.commit()
+        await session.refresh(existing)
+        return existing
+
     group = MonitoredGroup(chat_id=chat_id, title=title, is_active=True)
     session.add(group)
     await session.commit()

@@ -23,6 +23,7 @@ from telethon.tl.types import (
 from bot.client import userbot
 from bot import scheduler as sched_service
 from bot.downloads import (
+    FinalizeResult,
     create_media_download_record,
     download_first_media_url,
     extract_message_urls,
@@ -30,6 +31,7 @@ from bot.downloads import (
     get_download_dir,
     mark_media_download_completed,
     mark_media_download_failed,
+    _existing_file_matches,
     parse_telegram_message_link,
     telegram_source_url,
 )
@@ -254,17 +256,7 @@ def _message_media_filename(message) -> str:
 
 
 def _parallel_target_file_path(download_dir: Path, message) -> Path:
-    target = download_dir / _message_media_filename(message)
-    if not target.exists():
-        return target
-
-    stem = target.stem
-    suffix = target.suffix
-    for idx in range(1, 1000):
-        candidate = target.with_name(f"{stem}_{idx}{suffix}")
-        if not candidate.exists():
-            return candidate
-    return target.with_name(f"{stem}_{datetime.now(TZ_CST):%Y%m%d%H%M%S}{suffix}")
+    return download_dir / _message_media_filename(message)
 
 
 def _normalize_part_size(value: int) -> int:
@@ -365,6 +357,11 @@ async def _download_telegram_media(
     download_dir: Path,
     progress: DownloadProgress | None = None,
 ) -> str | None:
+    target_path = _parallel_target_file_path(download_dir, message)
+    if _existing_file_matches(target_path, _message_media_size(message)):
+        logger.info("[Download] Local Telegram media exists, skip download: {}", target_path)
+        return str(target_path)
+
     try:
         file_path = await _download_media_parallel(message, download_dir, progress)
         if file_path:
@@ -375,7 +372,7 @@ async def _download_telegram_media(
     if progress:
         await progress.reset("正在下载 Telegram 媒体资源（兼容模式）", _message_media_size(message))
     return await message.download_media(
-        file=str(download_dir),
+        file=str(target_path),
         progress_callback=progress.telethon_callback if progress else None,
     )
 
@@ -577,6 +574,11 @@ def _display_path(path: str) -> str:
         return str(path)
 
 
+def _download_success_text(target: str) -> str:
+    action = "文件已存在，上传完成" if getattr(target, "existed", False) else "下载完成"
+    return f"{action}: `{_display_path(target)}`"
+
+
 def _path_size(path: str | Path | None) -> int:
     if not path:
         return 0
@@ -605,20 +607,20 @@ async def _finish_download(
     target, error = await _finish_media_file(file_path, progress, download_id, source_url)
     if error:
         return await _reply(event, error)
-    await _reply(event, f"下载完成: `{_display_path(target)}`")
+    await _reply(event, _download_success_text(target))
 
 
 async def _reply_download_summary(event, targets: list[str], errors: list[str]) -> None:
     if targets and not errors:
         if len(targets) == 1:
-            return await _reply(event, f"下载完成: `{_display_path(targets[0])}`")
+            return await _reply(event, _download_success_text(targets[0]))
         lines = [f"下载完成，共 {len(targets)} 个资源："]
-        lines.extend(f"- `{_display_path(target)}`" for target in targets)
+        lines.extend(f"- {_download_success_text(target)}" for target in targets)
         return await _reply(event, "\n".join(lines))
 
     if targets and errors:
         lines = [f"部分下载完成: {len(targets)} 成功，{len(errors)} 失败"]
-        lines.extend(f"- `{_display_path(target)}`" for target in targets)
+        lines.extend(f"- {_download_success_text(target)}" for target in targets)
         lines.extend(f"- {error}" for error in errors[:3])
         return await _reply(event, "\n".join(lines))
 
@@ -672,8 +674,11 @@ def register_command_handlers() -> None:
             try:
                 await crud.add_group(session, chat_id=chat_id, title=title)
                 await _reply(event, f"已开始监控: **{title}** (`{chat_id}`)")
-            except Exception:
+            except crud.GroupAlreadyMonitoredError:
                 await _reply(event, f"群组 `{chat_id}` 已在监控中")
+            except Exception as e:
+                logger.exception("[Monitor] Failed to add group chat={}", chat_id)
+                await _reply(event, f"添加监控失败: `{e}`")
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.monitor remove$"))
     async def cmd_monitor_remove(event: events.NewMessage.Event):

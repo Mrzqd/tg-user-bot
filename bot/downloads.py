@@ -109,6 +109,13 @@ class DownloadSettings:
     reaction_notify_chat_id: int = 0
 
 
+class FinalizeResult(str):
+    def __new__(cls, value: str, existed: bool = False):
+        obj = str.__new__(cls, value)
+        obj.existed = existed
+        return obj
+
+
 class ProgressFileReader:
     def __init__(self, file_obj, callback=None, block_size: int = WEBDAV_UPLOAD_BLOCK_SIZE) -> None:
         self.file_obj = file_obj
@@ -369,17 +376,7 @@ def _message_media_filename(message) -> str:
 
 
 def _telegram_target_file_path(download_dir: Path, message) -> Path:
-    target = download_dir / _message_media_filename(message)
-    if not target.exists():
-        return target
-
-    stem = target.stem
-    suffix = target.suffix
-    for idx in range(1, 1000):
-        candidate = target.with_name(f"{stem}_{idx}{suffix}")
-        if not candidate.exists():
-            return candidate
-    return target.with_name(f"{stem}_{datetime.now(TZ_CST):%Y%m%d%H%M%S}{suffix}")
+    return download_dir / _message_media_filename(message)
 
 
 def _target_file_path(download_dir: Path, url: str, headers) -> Path:
@@ -396,16 +393,18 @@ def _target_file_path(download_dir: Path, url: str, headers) -> Path:
         if ext:
             target = target.with_suffix(ext)
 
-    if not target.exists():
-        return target
+    return target
 
-    stem = target.stem
-    suffix = target.suffix
-    for idx in range(1, 1000):
-        candidate = target.with_name(f"{stem}_{idx}{suffix}")
-        if not candidate.exists():
-            return candidate
-    return target.with_name(f"{stem}_{datetime.now(TZ_CST):%Y%m%d%H%M%S}{suffix}")
+
+def _existing_file_matches(path: Path, expected_size: int | None = None) -> bool:
+    if not path.exists():
+        return False
+    if expected_size is None or expected_size <= 0:
+        return True
+    try:
+        return path.stat().st_size == expected_size
+    except OSError:
+        return False
 
 
 def _url_request(url: str, method: str = "GET") -> Request:
@@ -452,8 +451,12 @@ def download_media_url(url: str, download_dir: Path, progress=None) -> str | Non
                 return None
 
             target_path = _target_file_path(download_dir, response_url, response.headers)
-            downloaded = 0
             content_length = response.headers.get("Content-Length")
+            expected_size = int(content_length) if content_length and content_length.isdigit() else None
+            if _existing_file_matches(target_path, expected_size):
+                logger.info("[Download] Local URL media exists, skip download: {}", target_path)
+                return str(target_path)
+            downloaded = 0
             if progress and content_length and content_length.isdigit():
                 progress.thread_callback(0, int(content_length))
             with target_path.open("wb") as f:
@@ -510,6 +513,10 @@ async def download_telegram_media_message(message) -> str | None:
 
     download_dir = await get_download_dir()
     target = _telegram_target_file_path(download_dir, message)
+    expected_size = _message_media_size(message)
+    if _existing_file_matches(target, expected_size):
+        logger.info("[Download] Local Telegram media exists, skip download: {}", target)
+        return str(target)
     return await message.download_media(file=str(target))
 
 
@@ -620,6 +627,21 @@ def _ensure_webdav_collections(opener, download_settings: DownloadSettings) -> N
             logger.debug("[WebDAV] MKCOL skipped/failed for {}: {}", current, e)
 
 
+def _webdav_file_exists(opener, target_url: str, download_settings: DownloadSettings) -> bool:
+    req = Request(target_url, method="HEAD")
+    _add_webdav_auth(req, download_settings)
+    try:
+        opener.open(req, timeout=60)
+        return True
+    except HTTPError as e:
+        if e.code == 404:
+            return False
+        if e.code in {405, 501}:
+            logger.debug("[WebDAV] HEAD unsupported for {}, continue upload: {}", target_url, e)
+            return False
+        raise
+
+
 def _put_webdav_file(
     opener,
     local_file: Path,
@@ -650,6 +672,9 @@ def _upload_webdav_file(local_file: Path, download_settings: DownloadSettings, p
     opener = _make_webdav_opener(download_settings)
 
     _ensure_webdav_collections(opener, download_settings)
+    if _webdav_file_exists(opener, target_url, download_settings):
+        logger.info("[WebDAV] Remote file exists, skip upload: {}", target_url)
+        return FinalizeResult(target_url, existed=True)
 
     last_error = None
     for attempt in range(1, 3):
@@ -664,7 +689,7 @@ def _upload_webdav_file(local_file: Path, download_settings: DownloadSettings, p
             time.sleep(1)
     if last_error:
         logger.debug("[WebDAV] PUT recovered after retry: {}", last_error)
-    return target_url
+    return FinalizeResult(target_url)
 
 
 def _join_s3_key(prefix: str, filename: str) -> str:
@@ -679,6 +704,20 @@ def _s3_object_url(download_settings: DownloadSettings, key: str) -> str:
         return f"{endpoint}/{quote(download_settings.s3_bucket)}/{quote(key, safe='/')}"
     region = download_settings.s3_region or "us-east-1"
     return f"https://{download_settings.s3_bucket}.s3.{region}.amazonaws.com/{quote(key, safe='/')}"
+
+
+def _s3_object_exists(client, bucket: str, key: str) -> bool:
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception as e:
+        response = getattr(e, "response", None) or {}
+        error = response.get("Error") if isinstance(response, dict) else {}
+        code = str(error.get("Code", ""))
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode") if isinstance(response, dict) else None
+        if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
+            return False
+        raise
 
 
 def _upload_s3_file(local_file: Path, download_settings: DownloadSettings, progress_callback=None) -> str:
@@ -711,6 +750,11 @@ def _upload_s3_file(local_file: Path, download_settings: DownloadSettings, progr
         aws_secret_access_key=download_settings.s3_secret_access_key,
         config=Config(s3={"addressing_style": addressing_style}),
     )
+    if _s3_object_exists(client, download_settings.s3_bucket, key):
+        target_url = _s3_object_url(download_settings, key)
+        logger.info("[S3] Remote file exists, skip upload: bucket={} key={}", download_settings.s3_bucket, key)
+        return FinalizeResult(target_url, existed=True)
+
     transfer = S3Transfer(
         client,
         TransferConfig(
@@ -747,24 +791,24 @@ def _upload_s3_file(local_file: Path, download_settings: DownloadSettings, progr
         "[S3] Uploaded {} -> bucket={} key={} chunk={} concurrency={}",
         local_file, download_settings.s3_bucket, key, chunk_size, concurrency,
     )
-    return _s3_object_url(download_settings, key)
+    return FinalizeResult(_s3_object_url(download_settings, key))
 
 
 async def finalize_download(local_file: str | Path, progress=None) -> str:
     file_path = Path(local_file)
     download_settings = await get_download_settings()
     if download_settings.target_type == "local":
-        return str(file_path)
+        return FinalizeResult(str(file_path))
 
     progress_callback = getattr(progress, "thread_callback", None) if progress else None
     if download_settings.target_type == "webdav":
         target_url = await asyncio.to_thread(_upload_webdav_file, file_path, download_settings, progress_callback)
-        logger.info("[WebDAV] Uploaded {} -> {}", file_path, target_url)
+        logger.info("[WebDAV] Finalized {} -> {}", file_path, target_url)
     elif download_settings.target_type == "s3":
         target_url = await asyncio.to_thread(_upload_s3_file, file_path, download_settings, progress_callback)
     else:
-        return str(file_path)
-    if not download_settings.keep_local:
+        return FinalizeResult(str(file_path))
+    if not download_settings.keep_local and not getattr(target_url, "existed", False):
         file_path.unlink(missing_ok=True)
     return target_url
 
