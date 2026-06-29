@@ -83,19 +83,32 @@ def _update_msg_id(update) -> int | None:
     return int(msg_id) if msg_id is not None else None
 
 
-def _peer_cache_key(update) -> str:
+def _peer_chat_id(update) -> str:
+    """Extract chat_id from update.peer and normalize to the same format as _message_reaction_key.
+
+    Produces the same numeric ID that Telethon's message.chat_id would give:
+      PeerChannel(channel_id=123)  -> "-100123"
+      PeerChat(chat_id=456)        -> "-456"
+      PeerUser(user_id=789)        -> "789"
+    """
     peer = getattr(update, "peer", None)
     if peer is None:
         return ""
-    for attr in ("channel_id", "chat_id", "user_id"):
-        value = getattr(peer, attr, None)
-        if value is not None:
-            return f"{type(peer).__name__}:{value}"
+    channel_id = getattr(peer, "channel_id", None)
+    if channel_id is not None:
+        return f"-100{channel_id}" if channel_id > 0 else str(channel_id)
+    chat_id = getattr(peer, "chat_id", None)
+    if chat_id is not None:
+        return str(-chat_id) if chat_id > 0 else str(chat_id)
+    user_id = getattr(peer, "user_id", None)
+    if user_id is not None:
+        return str(user_id)
     return str(peer)
 
 
 def _reaction_key(update, msg_id: int, emoji: str) -> tuple[str, int, str]:
-    return (_peer_cache_key(update), msg_id, emoji)
+    """Build cache key from raw update, using same format as _message_reaction_key."""
+    return (f"chat:{_peer_chat_id(update)}", msg_id, emoji)
 
 
 def _normalize_chat_id(value) -> str:
@@ -121,6 +134,13 @@ def _prune_reaction_cache(now: float) -> None:
 
 def _should_process_reaction(update, msg_id: int, emoji: str) -> tuple[bool, str]:
     key = _reaction_key(update, msg_id, emoji)
+
+    # Early check: skip if already processed or being processed
+    if key in _processed_reactions:
+        return False, f"already processed (key={key[0]})"
+    if key in _inflight_reactions:
+        return False, f"already inflight (key={key[0]})"
+
     recent_matched = any(_reaction_emoji(item) == emoji for item in _iter_recent_reactions(update))
     if recent_matched:
         return True, "recent_reactions"
@@ -139,7 +159,7 @@ def _should_process_reaction(update, msg_id: int, emoji: str) -> tuple[bool, str
     if current_count <= 0:
         return False, "target emoji count is zero"
     if previous_count is None:
-        return True, "reaction count observed"
+        return True, f"reaction count first observed (count={current_count})"
     if current_count > previous_count:
         return True, f"reaction count increased {previous_count}->{current_count}"
     return False, f"reaction count not increased {previous_count}->{current_count}"
@@ -352,7 +372,8 @@ def register_reaction_handlers() -> None:
 
     @client.on(events.Raw)
     async def on_raw_update(update):
-        if type(update).__name__ not in {"UpdateMessageReactions", "UpdateBotMessageReactions"}:
+        update_type = type(update).__name__
+        if update_type not in {"UpdateMessageReactions", "UpdateBotMessageReactions"}:
             return
 
         config = await get_download_settings()
@@ -364,22 +385,28 @@ def register_reaction_handlers() -> None:
         if not msg_id:
             return
 
+        now = time.monotonic()
+        _prune_reaction_cache(now)
+
         should_process, reason = _should_process_reaction(update, msg_id, wanted)
         if not should_process:
             logger.debug("[ReactionDownload] skipped msg={} reason={}", msg_id, reason)
             return
 
-        now = time.monotonic()
-        _prune_reaction_cache(now)
+        peer_id = _peer_chat_id(update)
+        logger.info(
+            "[ReactionDownload] matched emoji={} msg={} peer={} type={} reason={}",
+            wanted, msg_id, peer_id, update_type, reason,
+        )
 
         try:
-            logger.info("[ReactionDownload] matched emoji={} msg={} reason={}", wanted, msg_id, reason)
             chat = await _update_chat(update)
             if chat is None:
+                logger.warning("[ReactionDownload] cannot resolve chat for msg={} peer={}", msg_id, peer_id)
                 return
             msg = await userbot.client.get_messages(chat, ids=msg_id)
             if not msg:
-                logger.debug("[ReactionDownload] msg={} is not media, skipped", msg_id)
+                logger.debug("[ReactionDownload] msg={} not found or empty, skipped", msg_id)
                 return
             await _process_reacted_media(chat, msg, msg_id, config, reason)
         except Exception as e:
