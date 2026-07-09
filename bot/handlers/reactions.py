@@ -79,6 +79,8 @@ def _reaction_counts_are_complete(update) -> bool:
     reactions = getattr(update, "reactions", None)
     if isinstance(reactions, (list, tuple)):
         return True
+    if getattr(reactions, "min", False):
+        return False
     return getattr(reactions, "results", None) is not None
 
 
@@ -462,7 +464,10 @@ def register_reaction_handlers() -> None:
 
         should_process, reason = _should_process_reaction(update, msg_id, wanted)
         if not should_process:
-            logger.debug("[ReactionDownload] skipped msg={} reason={}", msg_id, reason)
+            logger.debug(
+                "[ReactionDownload] skipped msg={} type={} peer={} reason={}",
+                msg_id, update_type, _peer_chat_id(update), reason,
+            )
             return
 
         key = _reaction_key(update, msg_id, wanted)

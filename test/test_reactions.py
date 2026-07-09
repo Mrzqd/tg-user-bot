@@ -31,6 +31,23 @@ class ReactionMatchingTest(unittest.TestCase):
         self.assertTrue(matched)
         self.assertEqual(reason, "recent_reactions")
 
+    def test_matches_recent_reaction_when_aggregate_counts_are_partial(self):
+        update = SimpleNamespace(
+            peer=SimpleNamespace(channel_id=1001),
+            reactions=SimpleNamespace(
+                min=True,
+                results=[],
+                recent_reactions=[
+                    SimpleNamespace(reaction=SimpleNamespace(emoticon="👍")),
+                ],
+            ),
+        )
+
+        matched, reason = reactions._should_process_reaction(update, 10, "👍")
+
+        self.assertTrue(matched)
+        self.assertEqual(reason, "recent_reactions")
+
     def test_matches_aggregate_reaction_count_first_seen(self):
         update = SimpleNamespace(
             peer=SimpleNamespace(channel_id=1001),
