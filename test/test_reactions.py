@@ -48,6 +48,22 @@ class ReactionMatchingTest(unittest.TestCase):
         self.assertTrue(matched)
         self.assertEqual(reason, "recent_reactions")
 
+    def test_recent_reaction_wins_when_target_count_is_omitted(self):
+        update = SimpleNamespace(
+            peer=SimpleNamespace(channel_id=1001),
+            reactions=SimpleNamespace(
+                results=[],
+                recent_reactions=[
+                    SimpleNamespace(reaction=SimpleNamespace(emoticon="👍")),
+                ],
+            ),
+        )
+
+        matched, reason = reactions._should_process_reaction(update, 10, "👍")
+
+        self.assertTrue(matched)
+        self.assertEqual(reason, "recent_reactions")
+
     def test_matches_aggregate_reaction_count_first_seen(self):
         update = SimpleNamespace(
             peer=SimpleNamespace(channel_id=1001),

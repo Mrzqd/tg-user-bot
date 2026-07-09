@@ -192,15 +192,15 @@ def _should_process_reaction(update, msg_id: int, emoji: str) -> tuple[bool, str
                 return False, f"already processed (key={key[0]})"
             return True, "new_reactions"
 
-        if _reaction_counts_are_complete(update):
-            _last_reaction_counts[key] = 0
-            _clear_reaction_cycle(key)
-            return False, "target emoji count is zero"
-
         if recent_matched:
             if key in _processed_reactions:
                 return False, f"already processed (key={key[0]})"
             return True, "recent_reactions"
+
+        if _reaction_counts_are_complete(update):
+            _last_reaction_counts[key] = 0
+            _clear_reaction_cycle(key)
+            return False, "target emoji count is zero"
         return False, "target emoji not found"
 
     _last_reaction_counts[key] = current_count
