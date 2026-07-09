@@ -13,6 +13,7 @@ class ReactionMatchingTest(unittest.TestCase):
     def setUp(self):
         reactions._last_reaction_counts.clear()
         reactions._processed_reactions.clear()
+        reactions._pending_reactions.clear()
         reactions._inflight_reactions.clear()
 
     def test_matches_recent_reaction(self):
@@ -44,7 +45,23 @@ class ReactionMatchingTest(unittest.TestCase):
         matched, reason = reactions._should_process_reaction(update, 10, "👍")
 
         self.assertTrue(matched)
-        self.assertEqual(reason, "reaction count observed")
+        self.assertEqual(reason, "reaction count first observed (count=1)")
+
+    def test_matches_bot_reaction_update_count_list(self):
+        update = SimpleNamespace(
+            peer=SimpleNamespace(channel_id=1001),
+            reactions=[
+                SimpleNamespace(reaction=SimpleNamespace(emoticon="👍"), count=1),
+            ],
+        )
+
+        matched, reason = reactions._should_process_reaction(update, 10, "👍")
+
+        self.assertTrue(matched)
+        self.assertEqual(reason, "reaction count first observed (count=1)")
+
+    def test_accepts_single_bot_reaction_update_type(self):
+        self.assertIn("UpdateBotMessageReaction", reactions.REACTION_UPDATE_TYPES)
 
     def test_matches_new_reaction(self):
         update = SimpleNamespace(
@@ -119,6 +136,7 @@ class ReactionPollingTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         reactions._last_reaction_counts.clear()
         reactions._processed_reactions.clear()
+        reactions._pending_reactions.clear()
         reactions._inflight_reactions.clear()
 
     async def test_iter_reaction_dialogs_uses_all_visible_dialog_entities(self):
@@ -179,6 +197,41 @@ class ReactionPollingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(processed, ["poll reaction count increased 1->2"])
 
+    async def test_poll_retries_pending_reaction_without_count_increase(self):
+        chat = SimpleNamespace(id=1001, title="group-a")
+        message = SimpleNamespace(
+            id=10,
+            chat_id=1001,
+            media=SimpleNamespace(),
+            reactions=SimpleNamespace(
+                results=[SimpleNamespace(reaction=SimpleNamespace(emoticon="👍"), count=1)],
+            ),
+        )
+        config = SimpleNamespace(reaction_emoji="👍", reaction_notify_chat_id=2001)
+        key = reactions._message_reaction_key(1001, 10, "👍")
+        reactions._last_reaction_counts[key] = 1
+        reactions._pending_reactions[key] = (0.0, "raw update")
+        processed: list[str] = []
+
+        class FakeClient:
+            async def iter_messages(self, target, limit=None):
+                yield message
+
+        async def fake_process(chat_arg, msg_arg, msg_id_arg, config_arg, reason_arg):
+            processed.append(reason_arg)
+
+        original_client = getattr(reactions.userbot, "_client", None)
+        original_process = reactions._process_reacted_media
+        reactions.userbot._client = FakeClient()
+        reactions._process_reacted_media = fake_process
+        try:
+            await reactions._poll_chat_reactions(chat, config)
+        finally:
+            reactions.userbot._client = original_client
+            reactions._process_reacted_media = original_process
+
+        self.assertEqual(processed, ["retry pending reaction (raw update)"])
+
     async def test_process_reacted_media_uses_progress_notification(self):
         chat = SimpleNamespace(id=1001, title="group-a")
         message = SimpleNamespace(
@@ -212,25 +265,12 @@ class ReactionPollingTest(unittest.IsolatedAsyncioTestCase):
 
         notification = FakeNotification()
 
-        async def fake_create_record(**kwargs):
-            return SimpleNamespace(id=11)
-
         async def fake_get_download_dir():
             return "/tmp"
 
-        async def fake_download(download_msg, download_dir, progress):
+        async def fake_download(download_messages, download_dir, trigger_type, progress):
             progress_calls.append(f"download:{download_dir}:{progress is not None}")
-            return "/tmp/video.mp4"
-
-        async def fake_finalize(local_path):
-            progress_calls.append(f"finalize:{local_path}")
-            return "/downloads/video.mp4"
-
-        async def fake_completed(*args, **kwargs):
-            progress_calls.append("completed")
-
-        async def fake_failed(*args, **kwargs):
-            progress_calls.append("failed")
+            return ["/downloads/video.mp4"], []
 
         class FakeClient:
             async def send_message(self, chat_id, text):
@@ -240,51 +280,31 @@ class ReactionPollingTest(unittest.IsolatedAsyncioTestCase):
         originals = {
             "client": getattr(reactions.userbot, "_client", None),
             "progress": reactions.DownloadProgress,
-            "create_record": reactions.create_media_download_record,
             "get_download_dir": reactions.get_download_dir,
-            "download": reactions._download_telegram_media,
-            "finalize": reactions.finalize_download,
-            "completed": reactions.mark_media_download_completed,
-            "failed": reactions.mark_media_download_failed,
-            "size": reactions._path_size,
-            "mime": reactions._path_mime,
+            "download": reactions._download_and_finish_telegram_messages,
             "media_size": reactions._message_media_size,
         }
         reactions.userbot._client = FakeClient()
         reactions.DownloadProgress = FakeProgress
-        reactions.create_media_download_record = fake_create_record
         reactions.get_download_dir = fake_get_download_dir
-        reactions._download_telegram_media = fake_download
-        reactions.finalize_download = fake_finalize
-        reactions.mark_media_download_completed = fake_completed
-        reactions.mark_media_download_failed = fake_failed
-        reactions._path_size = lambda _: 1024
-        reactions._path_mime = lambda _: "video/mp4"
+        reactions._download_and_finish_telegram_messages = fake_download
         reactions._message_media_size = lambda _: 2048
         try:
             await reactions._process_reacted_media(chat, message, message.id, config, "test")
         finally:
             reactions.userbot._client = originals["client"]
             reactions.DownloadProgress = originals["progress"]
-            reactions.create_media_download_record = originals["create_record"]
             reactions.get_download_dir = originals["get_download_dir"]
-            reactions._download_telegram_media = originals["download"]
-            reactions.finalize_download = originals["finalize"]
-            reactions.mark_media_download_completed = originals["completed"]
-            reactions.mark_media_download_failed = originals["failed"]
-            reactions._path_size = originals["size"]
-            reactions._path_mime = originals["mime"]
+            reactions._download_and_finish_telegram_messages = originals["download"]
             reactions._message_media_size = originals["media_size"]
 
         self.assertIn("send:2001:正在下载 Telegram 媒体资源", progress_calls)
         self.assertIn("init:正在下载 Telegram 媒体资源:2048", progress_calls)
         self.assertIn("start", progress_calls)
         self.assertIn("download:/tmp:True", progress_calls)
-        self.assertIn("finish", progress_calls)
-        self.assertIn("completed", progress_calls)
         self.assertEqual(
             notification.edits,
-            ["正在保存到下载目标...", "下载完成: `/downloads/video.mp4`"],
+            ["下载完成: `/downloads/video.mp4`"],
         )
 
 

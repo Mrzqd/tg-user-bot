@@ -28,9 +28,15 @@ REACTION_CACHE_TTL = 12 * 3600
 REACTION_POLL_INTERVAL = 20
 REACTION_DIALOG_LIMIT = None
 REACTION_POLL_LIMIT = 40
+REACTION_UPDATE_TYPES = frozenset({
+    "UpdateMessageReactions",
+    "UpdateBotMessageReaction",
+    "UpdateBotMessageReactions",
+})
 
 _last_reaction_counts: dict[tuple[str, int, str], int] = {}
 _processed_reactions: dict[tuple[str, int, str], float] = {}
+_pending_reactions: dict[tuple[str, int, str], tuple[float, str]] = {}
 _inflight_reactions: set[tuple[str, int, str]] = set()
 _reaction_poll_task: asyncio.Task | None = None
 
@@ -47,7 +53,14 @@ def _iter_recent_reactions(update):
 
 def _iter_reaction_counts(update):
     reactions = getattr(update, "reactions", None)
-    return getattr(reactions, "results", None) or []
+    results = getattr(reactions, "results", None)
+    if results is not None:
+        return results
+    # UpdateBotMessageReactions carries ReactionCount objects directly in a
+    # vector, while UpdateMessageReactions wraps them in MessageReactions.
+    if isinstance(reactions, (list, tuple)):
+        return reactions
+    return []
 
 
 def _iter_new_reactions(update):
@@ -129,6 +142,14 @@ def _prune_reaction_cache(now: float) -> None:
     expired = [key for key, ts in _processed_reactions.items() if now - ts > REACTION_CACHE_TTL]
     for key in expired:
         _processed_reactions.pop(key, None)
+        _last_reaction_counts.pop(key, None)
+
+    expired_pending = [
+        key for key, (created_at, _) in _pending_reactions.items()
+        if now - created_at > REACTION_CACHE_TTL
+    ]
+    for key in expired_pending:
+        _pending_reactions.pop(key, None)
         _last_reaction_counts.pop(key, None)
 
 
@@ -237,6 +258,7 @@ async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) ->
 
     try:
         if not _is_downloadable_media_message(msg):
+            _pending_reactions.pop(key, None)
             logger.debug("[ReactionDownload] msg={} is not downloadable media, skipped", msg_id)
             return
 
@@ -274,6 +296,7 @@ async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) ->
         count = _message_reaction_count(msg, config.reaction_emoji.strip() or "👍")
         if count is not None:
             _last_reaction_counts[key] = count
+        _pending_reactions.pop(key, None)
         _processed_reactions[key] = time.monotonic()
         for item in group_messages:
             item_chat = str(getattr(item, "chat_id", None) or source_chat)
@@ -302,15 +325,23 @@ async def _poll_chat_reactions(chat, config) -> None:
             source_chat = str(getattr(msg, "chat_id", None) or chat_id)
             key = _message_reaction_key(source_chat, msg_id, wanted)
             current_count = _message_reaction_count(msg, wanted)
-            if current_count is None:
+            pending = _pending_reactions.get(key)
+            if current_count is None and pending is None:
                 continue
 
-            previous_count = _last_reaction_counts.get(key)
-            _last_reaction_counts[key] = current_count
-            if current_count <= 0:
+            if current_count is not None:
+                previous_count = _last_reaction_counts.get(key)
+                _last_reaction_counts[key] = current_count
+            else:
+                previous_count = None
+
+            if current_count is not None and current_count <= 0:
+                _pending_reactions.pop(key, None)
                 continue
 
-            if previous_count is None:
+            if pending is not None:
+                reason = f"retry pending reaction ({pending[1]})"
+            elif previous_count is None:
                 logger.debug(
                     "[ReactionDownload] poll baseline chat={} msg={} count={}",
                     chat_key,
@@ -318,12 +349,13 @@ async def _poll_chat_reactions(chat, config) -> None:
                     current_count,
                 )
                 continue
-            if current_count > previous_count:
+            elif current_count > previous_count:
                 reason = f"poll reaction count increased {previous_count}->{current_count}"
             else:
                 continue
 
             logger.info("[ReactionDownload] poll matched chat={} msg={} reason={}", chat_key, msg_id, reason)
+            _pending_reactions.setdefault(key, (time.monotonic(), reason))
             await _process_reacted_media(chat, msg, msg_id, config, reason)
     except Exception as e:
         logger.warning("[ReactionDownload] poll failed chat={}: {}", chat_id, e)
@@ -373,7 +405,7 @@ def register_reaction_handlers() -> None:
     @client.on(events.Raw)
     async def on_raw_update(update):
         update_type = type(update).__name__
-        if update_type not in {"UpdateMessageReactions", "UpdateBotMessageReactions"}:
+        if update_type not in REACTION_UPDATE_TYPES:
             return
 
         config = await get_download_settings()
@@ -393,7 +425,9 @@ def register_reaction_handlers() -> None:
             logger.debug("[ReactionDownload] skipped msg={} reason={}", msg_id, reason)
             return
 
+        key = _reaction_key(update, msg_id, wanted)
         peer_id = _peer_chat_id(update)
+        _pending_reactions[key] = (now, reason)
         logger.info(
             "[ReactionDownload] matched emoji={} msg={} peer={} type={} reason={}",
             wanted, msg_id, peer_id, update_type, reason,
