@@ -75,6 +75,13 @@ def _reaction_count(update, emoji: str) -> int | None:
     return _reaction_count_from_items(_iter_reaction_counts(update), emoji)
 
 
+def _reaction_counts_are_complete(update) -> bool:
+    reactions = getattr(update, "reactions", None)
+    if isinstance(reactions, (list, tuple)):
+        return True
+    return getattr(reactions, "results", None) is not None
+
+
 def _reaction_count_from_items(items, emoji: str) -> int | None:
     total = 0
     matched = False
@@ -138,6 +145,11 @@ def _message_reaction_key(chat_id: str, msg_id: int, emoji: str) -> tuple[str, i
     return (f"chat:{_normalize_chat_id(chat_id)}", msg_id, emoji)
 
 
+def _clear_reaction_cycle(key: tuple[str, int, str]) -> None:
+    _processed_reactions.pop(key, None)
+    _pending_reactions.pop(key, None)
+
+
 def _prune_reaction_cache(now: float) -> None:
     expired = [key for key, ts in _processed_reactions.items() if now - ts > REACTION_CACHE_TTL]
     for key in expired:
@@ -156,33 +168,61 @@ def _prune_reaction_cache(now: float) -> None:
 def _should_process_reaction(update, msg_id: int, emoji: str) -> tuple[bool, str]:
     key = _reaction_key(update, msg_id, emoji)
 
-    # Early check: skip if already processed or being processed
-    if key in _processed_reactions:
-        return False, f"already processed (key={key[0]})"
     if key in _inflight_reactions:
         return False, f"already inflight (key={key[0]})"
 
     recent_matched = any(_reaction_emoji(item) == emoji for item in _iter_recent_reactions(update))
-    if recent_matched:
-        return True, "recent_reactions"
-
     new_matched = any(_reaction_emoji(item) == emoji for item in _iter_new_reactions(update))
     old_matched = any(_reaction_emoji(item) == emoji for item in _iter_old_reactions(update))
-    if new_matched and not old_matched:
-        return True, "new_reactions"
-
     current_count = _reaction_count(update, emoji)
+    previous_count = _last_reaction_counts.get(key)
+
     if current_count is None:
+        if old_matched and not new_matched:
+            # UpdateBotMessageReaction contains a delta, so removing one
+            # reaction decreases the aggregate count by one.
+            _last_reaction_counts[key] = max((previous_count or 1) - 1, 0)
+            _clear_reaction_cycle(key)
+            return False, "target reaction removed"
+
+        if new_matched and not old_matched:
+            if key in _processed_reactions:
+                return False, f"already processed (key={key[0]})"
+            return True, "new_reactions"
+
+        if _reaction_counts_are_complete(update):
+            _last_reaction_counts[key] = 0
+            _clear_reaction_cycle(key)
+            return False, "target emoji count is zero"
+
+        if recent_matched:
+            if key in _processed_reactions:
+                return False, f"already processed (key={key[0]})"
+            return True, "recent_reactions"
         return False, "target emoji not found"
 
-    previous_count = _last_reaction_counts.get(key)
     _last_reaction_counts[key] = current_count
     if current_count <= 0:
+        _clear_reaction_cycle(key)
         return False, "target emoji count is zero"
+
     if previous_count is None:
+        if key in _processed_reactions:
+            return False, f"already processed (key={key[0]})"
         return True, f"reaction count first observed (count={current_count})"
+
+    if current_count < previous_count:
+        _clear_reaction_cycle(key)
+        return False, f"reaction count decreased {previous_count}->{current_count}"
+
+    if key in _processed_reactions:
+        return False, f"already processed (key={key[0]})"
+    if new_matched and not old_matched:
+        return True, "new_reactions"
     if current_count > previous_count:
         return True, f"reaction count increased {previous_count}->{current_count}"
+    if recent_matched:
+        return True, "recent_reactions"
     return False, f"reaction count not increased {previous_count}->{current_count}"
 
 

@@ -121,6 +121,37 @@ class ReactionMatchingTest(unittest.TestCase):
         self.assertTrue(matched)
         self.assertEqual(reason, "reaction count increased 1->2")
 
+    def test_unreact_then_react_starts_a_new_download_cycle(self):
+        key_update = SimpleNamespace(peer=SimpleNamespace(channel_id=1001))
+        added = SimpleNamespace(
+            peer=key_update.peer,
+            reactions=SimpleNamespace(
+                recent_reactions=[],
+                results=[
+                    SimpleNamespace(reaction=SimpleNamespace(emoticon="👍"), count=1),
+                ],
+            ),
+        )
+        removed = SimpleNamespace(
+            peer=key_update.peer,
+            reactions=SimpleNamespace(recent_reactions=[], results=[]),
+        )
+
+        matched, _ = reactions._should_process_reaction(added, 10, "👍")
+        self.assertTrue(matched)
+        key = reactions._reaction_key(key_update, 10, "👍")
+        reactions._processed_reactions[key] = 1.0
+
+        matched, reason = reactions._should_process_reaction(removed, 10, "👍")
+        self.assertFalse(matched)
+        self.assertEqual(reason, "target emoji count is zero")
+        self.assertNotIn(key, reactions._processed_reactions)
+        self.assertEqual(reactions._last_reaction_counts[key], 0)
+
+        matched, reason = reactions._should_process_reaction(added, 10, "👍")
+        self.assertTrue(matched)
+        self.assertEqual(reason, "reaction count increased 0->1")
+
     def test_message_reaction_key_normalizes_chat_id(self):
         self.assertEqual(
             reactions._message_reaction_key(1001, 10, "👍"),
