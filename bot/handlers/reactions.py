@@ -1,11 +1,10 @@
 """
 Reaction-based media download handler.
-Downloads media when configured emoji reaction is added to a message,
+Downloads media when configured emoji reaction is removed from a message,
 then pushes the result to a configured notification chat.
 """
 from __future__ import annotations
 
-import asyncio
 import time
 
 from loguru import logger
@@ -25,20 +24,14 @@ from bot.handlers.commands import (
 )
 
 REACTION_CACHE_TTL = 12 * 3600
-REACTION_POLL_INTERVAL = 20
-REACTION_DIALOG_LIMIT = None
-REACTION_POLL_LIMIT = 40
 REACTION_UPDATE_TYPES = frozenset({
     "UpdateMessageReactions",
     "UpdateBotMessageReaction",
     "UpdateBotMessageReactions",
 })
 
-_last_reaction_counts: dict[tuple[str, int, str], int] = {}
 _processed_reactions: dict[tuple[str, int, str], float] = {}
-_pending_reactions: dict[tuple[str, int, str], tuple[float, str]] = {}
 _inflight_reactions: set[tuple[str, int, str]] = set()
-_reaction_poll_task: asyncio.Task | None = None
 
 
 def _reaction_emoji(reaction) -> str:
@@ -95,11 +88,6 @@ def _reaction_count_from_items(items, emoji: str) -> int | None:
     return total if matched else None
 
 
-def _message_reaction_count(message, emoji: str) -> int | None:
-    reactions = getattr(message, "reactions", None)
-    return _reaction_count_from_items(getattr(reactions, "results", None) or [], emoji)
-
-
 def _update_msg_id(update) -> int | None:
     msg_id = getattr(update, "msg_id", None)
     return int(msg_id) if msg_id is not None else None
@@ -149,22 +137,12 @@ def _message_reaction_key(chat_id: str, msg_id: int, emoji: str) -> tuple[str, i
 
 def _clear_reaction_cycle(key: tuple[str, int, str]) -> None:
     _processed_reactions.pop(key, None)
-    _pending_reactions.pop(key, None)
 
 
 def _prune_reaction_cache(now: float) -> None:
     expired = [key for key, ts in _processed_reactions.items() if now - ts > REACTION_CACHE_TTL]
     for key in expired:
         _processed_reactions.pop(key, None)
-        _last_reaction_counts.pop(key, None)
-
-    expired_pending = [
-        key for key, (created_at, _) in _pending_reactions.items()
-        if now - created_at > REACTION_CACHE_TTL
-    ]
-    for key in expired_pending:
-        _pending_reactions.pop(key, None)
-        _last_reaction_counts.pop(key, None)
 
 
 def _should_process_reaction(update, msg_id: int, emoji: str) -> tuple[bool, str]:
@@ -177,55 +155,27 @@ def _should_process_reaction(update, msg_id: int, emoji: str) -> tuple[bool, str
     new_matched = any(_reaction_emoji(item) == emoji for item in _iter_new_reactions(update))
     old_matched = any(_reaction_emoji(item) == emoji for item in _iter_old_reactions(update))
     current_count = _reaction_count(update, emoji)
-    previous_count = _last_reaction_counts.get(key)
 
-    if current_count is None:
-        if old_matched and not new_matched:
-            # UpdateBotMessageReaction contains a delta, so removing one
-            # reaction decreases the aggregate count by one.
-            _last_reaction_counts[key] = max((previous_count or 1) - 1, 0)
-            _clear_reaction_cycle(key)
-            return False, "target reaction removed"
-
-        if new_matched and not old_matched:
-            if key in _processed_reactions:
-                return False, f"already processed (key={key[0]})"
-            return True, "new_reactions"
-
-        if recent_matched:
-            if key in _processed_reactions:
-                return False, f"already processed (key={key[0]})"
-            return True, "recent_reactions"
-
-        if _reaction_counts_are_complete(update):
-            _last_reaction_counts[key] = 0
-            _clear_reaction_cycle(key)
-            return False, "target emoji count is zero"
-        return False, "target emoji not found"
-
-    _last_reaction_counts[key] = current_count
-    if current_count <= 0:
-        _clear_reaction_cycle(key)
-        return False, "target emoji count is zero"
-
-    if previous_count is None:
+    if old_matched and not new_matched:
         if key in _processed_reactions:
             return False, f"already processed (key={key[0]})"
-        return True, f"reaction count first observed (count={current_count})"
+        return True, "target reaction removed"
 
-    if current_count < previous_count:
+    if new_matched or recent_matched or (current_count is not None and current_count > 0):
         _clear_reaction_cycle(key)
-        return False, f"reaction count decreased {previous_count}->{current_count}"
+        return False, "target reaction present"
 
-    if key in _processed_reactions:
-        return False, f"already processed (key={key[0]})"
-    if new_matched and not old_matched:
-        return True, "new_reactions"
-    if current_count > previous_count:
-        return True, f"reaction count increased {previous_count}->{current_count}"
-    if recent_matched:
-        return True, "recent_reactions"
-    return False, f"reaction count not increased {previous_count}->{current_count}"
+    if current_count is not None and current_count <= 0:
+        if key in _processed_reactions:
+            return False, f"already processed (key={key[0]})"
+        return True, "target emoji count is zero"
+
+    if _reaction_counts_are_complete(update):
+        if key in _processed_reactions:
+            return False, f"already processed (key={key[0]})"
+        return True, "target emoji count is zero"
+
+    return False, "target emoji not found"
 
 
 async def _update_chat(update):
@@ -300,7 +250,6 @@ async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) ->
 
     try:
         if not _is_downloadable_media_message(msg):
-            _pending_reactions.pop(key, None)
             logger.debug("[ReactionDownload] msg={} is not downloadable media, skipped", msg_id)
             return
 
@@ -335,10 +284,6 @@ async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) ->
 
         chat_title = getattr(chat, "title", None) or getattr(chat, "username", None) or source_chat
         await _notify_download_success(config.reaction_notify_chat_id, targets, progress_message)
-        count = _message_reaction_count(msg, config.reaction_emoji.strip() or "👍")
-        if count is not None:
-            _last_reaction_counts[key] = count
-        _pending_reactions.pop(key, None)
         _processed_reactions[key] = time.monotonic()
         for item in group_messages:
             item_chat = str(getattr(item, "chat_id", None) or source_chat)
@@ -350,98 +295,7 @@ async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) ->
         _inflight_reactions.discard(key)
 
 
-async def _poll_chat_reactions(chat, config) -> None:
-    wanted = config.reaction_emoji.strip() or "👍"
-    chat_id = getattr(chat, "id", chat)
-    chat_key = f"chat:{chat_id}"
-
-    try:
-        async for msg in userbot.client.iter_messages(chat, limit=REACTION_POLL_LIMIT):
-            if not _is_downloadable_media_message(msg):
-                continue
-
-            msg_id = int(getattr(msg, "id", 0) or 0)
-            if not msg_id:
-                continue
-
-            source_chat = str(getattr(msg, "chat_id", None) or chat_id)
-            key = _message_reaction_key(source_chat, msg_id, wanted)
-            current_count = _message_reaction_count(msg, wanted)
-            pending = _pending_reactions.get(key)
-            if current_count is None and pending is None:
-                continue
-
-            if current_count is not None:
-                previous_count = _last_reaction_counts.get(key)
-                _last_reaction_counts[key] = current_count
-            else:
-                previous_count = None
-
-            if current_count is not None and current_count <= 0:
-                _pending_reactions.pop(key, None)
-                continue
-
-            if pending is not None:
-                reason = f"retry pending reaction ({pending[1]})"
-            elif previous_count is None:
-                logger.debug(
-                    "[ReactionDownload] poll baseline chat={} msg={} count={}",
-                    chat_key,
-                    msg_id,
-                    current_count,
-                )
-                continue
-            elif current_count > previous_count:
-                reason = f"poll reaction count increased {previous_count}->{current_count}"
-            else:
-                continue
-
-            logger.info("[ReactionDownload] poll matched chat={} msg={} reason={}", chat_key, msg_id, reason)
-            _pending_reactions.setdefault(key, (time.monotonic(), reason))
-            await _process_reacted_media(chat, msg, msg_id, config, reason)
-    except Exception as e:
-        logger.warning("[ReactionDownload] poll failed chat={}: {}", chat_id, e)
-
-
-async def _iter_reaction_dialogs():
-    seen = set()
-    async for dialog in userbot.client.iter_dialogs(limit=REACTION_DIALOG_LIMIT):
-        entity = getattr(dialog, "entity", None)
-        chat_id = getattr(dialog, "id", None) or getattr(entity, "id", None)
-        if entity is None or chat_id is None:
-            continue
-        key = _normalize_chat_id(chat_id)
-        if key in seen:
-            continue
-        seen.add(key)
-        yield entity
-
-
-async def _reaction_poll_loop() -> None:
-    logger.info(
-        "Reaction polling started (interval={}s, dialogs={}, messages_per_dialog={})",
-        REACTION_POLL_INTERVAL,
-        REACTION_DIALOG_LIMIT or "all",
-        REACTION_POLL_LIMIT,
-    )
-    while True:
-        await asyncio.sleep(REACTION_POLL_INTERVAL)
-        try:
-            config = await get_download_settings()
-            if not config.reaction_enabled or not config.reaction_notify_chat_id:
-                continue
-
-            async for chat in _iter_reaction_dialogs():
-                await _poll_chat_reactions(chat, config)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning("[ReactionDownload] poll loop failed: {}", e)
-
-
 def register_reaction_handlers() -> None:
-    global _reaction_poll_task
-
     client = userbot.client
 
     @client.on(events.Raw)
@@ -470,9 +324,7 @@ def register_reaction_handlers() -> None:
             )
             return
 
-        key = _reaction_key(update, msg_id, wanted)
         peer_id = _peer_chat_id(update)
-        _pending_reactions[key] = (now, reason)
         logger.info(
             "[ReactionDownload] matched emoji={} msg={} peer={} type={} reason={}",
             wanted, msg_id, peer_id, update_type, reason,
@@ -492,7 +344,4 @@ def register_reaction_handlers() -> None:
             logger.exception("[ReactionDownload] Failed to process reaction update: {}", e)
             await _notify_download_failed(config.reaction_notify_chat_id, e)
 
-    if _reaction_poll_task is None or _reaction_poll_task.done():
-        _reaction_poll_task = asyncio.create_task(_reaction_poll_loop())
-
-    logger.info("Reaction handlers registered")
+    logger.info("Reaction handlers registered (event-only, trigger=removed)")

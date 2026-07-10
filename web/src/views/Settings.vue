@@ -146,7 +146,7 @@
       </div>
 
       <div class="mt-6 pt-5 border-t border-border">
-        <h3 class="text-sm font-semibold text-accent mb-4">点赞下载</h3>
+        <h3 class="text-sm font-semibold text-accent mb-4">取消点赞下载</h3>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <label class="inline-flex items-center gap-2 text-sm text-dim md:mt-7">
             <input v-model="form.reaction_enabled" type="checkbox" />
