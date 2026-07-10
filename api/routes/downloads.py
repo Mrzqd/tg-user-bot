@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.deps import verify_api_key
-from api.models import MediaDownloadOut
+from api.models import MediaDownloadOut, MediaDownloadStatsOut
 from bot.downloads import queue_media_download_retry, retry_media_download
 from database import crud
 from database.engine import async_session
@@ -23,6 +23,20 @@ async def list_downloads(
     async with async_session() as session:
         items = await crud.get_media_downloads(session, status=status, limit=limit, offset=offset)
     return [MediaDownloadOut.model_validate(item) for item in items]
+
+
+@router.get("/stats", response_model=MediaDownloadStatsOut)
+async def download_stats():
+    async with async_session() as session:
+        data = await crud.get_media_download_stats(session)
+    counts = data["counts"]
+    return MediaDownloadStatsOut(
+        queued=counts.get("queued", 0),
+        running=counts.get("running", 0),
+        completed=counts.get("completed", 0),
+        failed=counts.get("failed", 0),
+        total_speed_bps=data["total_speed_bps"],
+    )
 
 
 @router.post("/{download_id}/retry", response_model=MediaDownloadOut)

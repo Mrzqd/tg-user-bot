@@ -19,3 +19,8 @@ export function fmtDuration(ms) {
   if (ms < 1000) return `${ms} ms`
   return `${(ms / 1000).toFixed(1)} s`
 }
+
+export function fmtSpeed(bps) {
+  if (!bps) return ''
+  return `${fmtBytes(bps)}/s`
+}

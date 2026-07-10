@@ -91,5 +91,6 @@ export const api = {
     const qs = new URLSearchParams(params).toString()
     return request(`/downloads${qs ? '?' + qs : ''}`)
   },
+  getDownloadStats: () => request('/downloads/stats'),
   retryDownload: (id) => request(`/downloads/${id}/retry`, { method: 'POST' }),
 }

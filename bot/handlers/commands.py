@@ -31,8 +31,10 @@ from bot.downloads import (
     get_download_dir,
     mark_media_download_completed,
     mark_media_download_failed,
+    mark_media_download_running,
     _clean_filename,
     _existing_file_matches,
+    _message_media_size,
     parse_telegram_message_link,
     telegram_source_url,
 )
@@ -44,6 +46,7 @@ TZ_CST = timezone(timedelta(hours=8))
 MIN_PARALLEL_DOWNLOAD_SIZE = 1024 * 1024
 PROGRESS_UPDATE_INTERVAL = 10.0
 PROGRESS_FORCE_UPDATE_INTERVAL = 5.0
+PROGRESS_DB_WRITE_INTERVAL = 1.5
 MEDIA_GROUP_SCAN_LIMIT = 20
 
 
@@ -73,6 +76,42 @@ class DownloadProgress:
         self.pending_update: asyncio.Task | None = None
         self.lock = asyncio.Lock()
         self.loop = asyncio.get_running_loop()
+        # Web 端实时进度落库：与 Telegram 消息编辑独立节流
+        self.download_id: int | None = None
+        self.stage = "downloading"
+        self.last_db_write_at = 0.0
+        self.db_task: asyncio.Task | None = None
+
+    def bind_record(self, download_id: int | None, stage: str = "downloading") -> None:
+        """Attach a media_downloads row so progress is mirrored to the web console."""
+        self.download_id = download_id
+        self.stage = stage
+        self.last_db_write_at = 0.0
+
+    def _speed(self) -> float:
+        elapsed = max(time.monotonic() - self.started_at, 0.001)
+        return self.current / elapsed
+
+    def _request_db_write(self, force: bool = False) -> None:
+        if not self.download_id:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_db_write_at < PROGRESS_DB_WRITE_INTERVAL:
+            return
+        if self.db_task and not self.db_task.done():
+            return
+        self.last_db_write_at = now
+        self.db_task = self.loop.create_task(
+            self._write_progress(self.download_id, self.current, self.total or 0, int(self._speed()), self.stage)
+        )
+
+    @staticmethod
+    async def _write_progress(download_id: int, downloaded: int, total: int, speed: int, stage: str) -> None:
+        try:
+            async with async_session() as session:
+                await crud.update_media_download_progress(session, download_id, downloaded, total, speed, stage)
+        except Exception as e:
+            logger.debug("[Download] Failed to persist progress id={}: {}", download_id, e)
 
     async def start(self) -> None:
         await self.update(force=True)
@@ -102,17 +141,21 @@ class DownloadProgress:
         self.current += int(delta or 0)
         self._request_update()
 
-    async def reset(self, label: str | None = None, total: int | None = None) -> None:
+    async def reset(self, label: str | None = None, total: int | None = None, stage: str | None = None) -> None:
         if label:
             self.label = label
+        if stage:
+            self.stage = stage
         self.total = total
         self.current = 0
         self.started_at = time.monotonic()
         self.last_update_at = 0.0
         self.last_text = ""
+        self._request_db_write(force=True)
         await self.update(force=True)
 
     def _request_update(self) -> None:
+        self._request_db_write()
         now = time.monotonic()
         if now < self.flood_wait_until:
             return
@@ -123,6 +166,8 @@ class DownloadProgress:
         self.pending_update = self.loop.create_task(self.update())
 
     async def update(self, force: bool = False) -> None:
+        if self.event is None:
+            return
         now = time.monotonic()
         if now < self.flood_wait_until:
             return
@@ -217,25 +262,6 @@ async def _do_delete(event, chat_id: int, msg_id: int, delay: int) -> None:
         logger.debug("[CmdDel] Deleted cmd msg {} in chat {} (after {}s)", msg_id, chat_id, delay)
     except Exception as e:
         logger.warning("[CmdDel] Failed to delete cmd msg {} in {}: {}", msg_id, chat_id, e)
-
-
-def _message_media_size(message) -> int | None:
-    media = getattr(message, "media", None)
-    document = getattr(media, "document", None)
-    if document and getattr(document, "size", None):
-        return int(document.size)
-
-    photo = getattr(media, "photo", None)
-    if photo and getattr(photo, "sizes", None):
-        sizes = []
-        for size in photo.sizes:
-            value = getattr(size, "size", None)
-            if value:
-                sizes.append(int(value))
-        if sizes:
-            return max(sizes)
-
-    return None
 
 
 def _message_media_filename(message) -> str:
@@ -421,7 +447,7 @@ async def _finish_media_file(
     file_size = _path_size(file_path)
     mime_type = _path_mime(file_path)
     if progress:
-        await progress.reset("正在保存到下载目标", file_size)
+        await progress.reset("正在保存到下载目标", file_size, stage="uploading")
     try:
         target = await finalize_download(file_path, progress)
     except Exception as e:
@@ -448,16 +474,22 @@ async def _download_and_finish_telegram_message(
     trigger_type: str,
     progress: DownloadProgress | None = None,
     source_url: str | None = None,
+    record=None,
 ) -> tuple[str | None, str]:
     source_chat = str(getattr(message, "chat_id", ""))
     msg_id = int(getattr(message, "id", 0) or 0)
-    record = await create_media_download_record(
-        source_type="telegram_media",
-        trigger_type=trigger_type,
-        source_url=source_url or telegram_source_url(source_chat, msg_id),
-        source_chat=source_chat,
-        source_message_id=msg_id,
-    )
+    if record is None:
+        record = await create_media_download_record(
+            source_type="telegram_media",
+            trigger_type=trigger_type,
+            source_url=source_url or telegram_source_url(source_chat, msg_id),
+            source_chat=source_chat,
+            source_message_id=msg_id,
+        )
+    else:
+        await mark_media_download_running(record.id)
+    if progress:
+        progress.bind_record(record.id, stage="downloading")
     try:
         file_path = await _download_telegram_media(message, download_dir, progress)
     except Exception as e:
@@ -482,10 +514,25 @@ async def _download_and_finish_telegram_messages(
     targets = []
     errors = []
     total = len(messages)
-    for idx, message in enumerate(messages, 1):
+    # 预建全部下载记录（排队中），Web 端可立即看到待下载队列
+    records = []
+    for message in messages:
+        source_chat = str(getattr(message, "chat_id", ""))
+        msg_id = int(getattr(message, "id", 0) or 0)
+        records.append(await create_media_download_record(
+            source_type="telegram_media",
+            trigger_type=trigger_type,
+            source_url=telegram_source_url(source_chat, msg_id),
+            source_chat=source_chat,
+            source_message_id=msg_id,
+            status="queued",
+        ))
+    for idx, (message, record) in enumerate(zip(messages, records), 1):
         if progress:
             await progress.reset(f"正在下载 Telegram 媒体资源 ({idx}/{total})", _message_media_size(message))
-        target, error = await _download_and_finish_telegram_message(message, download_dir, trigger_type, progress)
+        target, error = await _download_and_finish_telegram_message(
+            message, download_dir, trigger_type, progress, record=record,
+        )
         if target:
             targets.append(target)
         if error:
@@ -805,6 +852,8 @@ def register_command_handlers() -> None:
                 source_chat=str(event.chat_id),
                 source_message_id=reply.id,
             )
+            if progress:
+                progress.bind_record(record.id, stage="downloading")
             try:
                 file_path, reason, source_url = await asyncio.to_thread(download_first_media_url, [url], download_dir, progress)
             except Exception as e:

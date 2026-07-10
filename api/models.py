@@ -223,6 +223,10 @@ class MediaDownloadOut(BaseModel):
     file_name: str
     mime_type: str
     file_size: int
+    downloaded_bytes: int = 0
+    total_bytes: int = 0
+    speed_bps: int = 0
+    stage: str = ""
     error: str
     retry_count: int
     started_at: Optional[datetime]
@@ -232,6 +236,14 @@ class MediaDownloadOut(BaseModel):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class MediaDownloadStatsOut(BaseModel):
+    queued: int = 0
+    running: int = 0
+    completed: int = 0
+    failed: int = 0
+    total_speed_bps: int = 0
 
 
 class WebLoginOut(BaseModel):

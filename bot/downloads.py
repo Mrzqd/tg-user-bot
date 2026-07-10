@@ -357,6 +357,25 @@ def extract_message_urls(message) -> list[str]:
     return urls
 
 
+def _message_media_size(message) -> int | None:
+    media = getattr(message, "media", None)
+    document = getattr(media, "document", None)
+    if document and getattr(document, "size", None):
+        return int(document.size)
+
+    photo = getattr(media, "photo", None)
+    if photo and getattr(photo, "sizes", None):
+        sizes = []
+        for size in photo.sizes:
+            value = getattr(size, "size", None)
+            if value:
+                sizes.append(int(value))
+        if sizes:
+            return max(sizes)
+
+    return None
+
+
 def _message_media_filename(message) -> str:
     media = getattr(message, "media", None)
     document = getattr(media, "document", None)
@@ -507,7 +526,7 @@ def download_first_media_url(
     return None, f"链接检查失败: {last_error}" if last_error else "未找到可下载的媒体链接", ""
 
 
-async def download_telegram_media_message(message) -> str | None:
+async def download_telegram_media_message(message, progress=None) -> str | None:
     if not getattr(message, "media", None):
         return None
 
@@ -517,7 +536,10 @@ async def download_telegram_media_message(message) -> str | None:
     if _existing_file_matches(target, expected_size):
         logger.info("[Download] Local Telegram media exists, skip download: {}", target)
         return str(target)
-    return await message.download_media(file=str(target))
+    return await message.download_media(
+        file=str(target),
+        progress_callback=progress.telethon_callback if progress else None,
+    )
 
 
 async def download_telegram_message_link(url: str, progress=None) -> tuple[str | None, str, str]:
@@ -540,7 +562,7 @@ async def download_telegram_message_link(url: str, progress=None) -> tuple[str |
         return None, "消息链接对应的消息不是媒体资源", ""
 
     try:
-        file_path = await download_telegram_media_message(msg)
+        file_path = await download_telegram_media_message(msg, progress)
     except Exception as e:
         logger.warning("[Download] Failed to download Telegram linked media chat={} msg={}: {}", chat, msg_id, e)
         return None, f"消息链接媒体下载失败: {e}", ""
@@ -947,7 +969,12 @@ async def mark_media_download_completed(
             "error": "",
             "completed_at": completed_at,
             "duration_ms": _duration_ms(item.started_at, completed_at),
+            "speed_bps": 0,
+            "stage": "",
         }
+        final_size = values["file_size"]
+        values["downloaded_bytes"] = final_size
+        values["total_bytes"] = final_size
         if source_url is not None:
             values["source_url"] = source_url
         await crud.update_media_download(session, download_id, **values)
@@ -969,7 +996,39 @@ async def mark_media_download_failed(download_id: int, error: str) -> None:
             error=str(error)[:2000],
             completed_at=completed_at,
             duration_ms=_duration_ms(item.started_at, completed_at),
+            speed_bps=0,
+            stage="",
         )
+
+
+async def mark_media_download_running(download_id: int) -> None:
+    """Queued -> running transition, resetting live progress fields."""
+    from database import crud
+    from database.engine import async_session
+
+    async with async_session() as session:
+        await crud.update_media_download(
+            session,
+            download_id,
+            status="running",
+            started_at=_now_cst(),
+            completed_at=None,
+            duration_ms=0,
+            error="",
+            downloaded_bytes=0,
+            total_bytes=0,
+            speed_bps=0,
+            stage="downloading",
+        )
+
+
+async def fail_stale_media_downloads() -> int:
+    """服务启动时清理上次进程遗留的 queued/running 记录，允许用户手动重试。"""
+    from database import crud
+    from database.engine import async_session
+
+    async with async_session() as session:
+        return await crud.fail_stale_media_downloads(session, error="服务重启导致下载中断，请重试")
 
 
 async def queue_media_download_retry(download_id: int):
@@ -991,6 +1050,10 @@ async def queue_media_download_retry(download_id: int):
             started_at=None,
             completed_at=None,
             duration_ms=0,
+            downloaded_bytes=0,
+            total_bytes=0,
+            speed_bps=0,
+            stage="",
         )
 
 
@@ -1005,6 +1068,7 @@ def _source_chat_ref(value: str):
 
 async def retry_media_download(download_id: int) -> None:
     from bot.client import userbot
+    from bot.handlers.commands import DownloadProgress
     from database import crud
     from database.engine import async_session
 
@@ -1021,16 +1085,24 @@ async def retry_media_download(download_id: int) -> None:
             completed_at=None,
             duration_ms=0,
             error="",
+            downloaded_bytes=0,
+            total_bytes=0,
+            speed_bps=0,
+            stage="downloading",
         )
         source_type = item.source_type
         source_url = item.source_url
         source_chat = item.source_chat
         source_message_id = item.source_message_id
 
+    # 无 Telegram 通知消息的进度对象：只负责把实时进度写入数据库
+    progress = DownloadProgress(None, "Web 重试下载")
+    progress.bind_record(download_id, stage="downloading")
+
     local_path = ""
     try:
         if source_type == "telegram_message_link":
-            local_path, reason, _ = await download_telegram_message_link(source_url)
+            local_path, reason, _ = await download_telegram_message_link(source_url, progress)
             if not local_path:
                 raise RuntimeError(reason or "Telegram 消息链接未返回媒体文件")
         elif source_type == "telegram_media":
@@ -1040,12 +1112,12 @@ async def retry_media_download(download_id: int) -> None:
             msg = await userbot.client.get_messages(chat_ref, ids=source_message_id)
             if not msg or not getattr(msg, "media", None):
                 raise RuntimeError("原消息不存在或不是媒体资源")
-            local_path = await download_telegram_media_message(msg) or ""
+            local_path = await download_telegram_media_message(msg, progress) or ""
             if not local_path:
                 raise RuntimeError("Telegram 未返回文件路径")
         elif source_type == "http_url":
             download_dir = await get_download_dir()
-            local_path = await asyncio.to_thread(download_media_url, source_url, download_dir, None) or ""
+            local_path = await asyncio.to_thread(download_media_url, source_url, download_dir, progress) or ""
             if not local_path:
                 raise RuntimeError("链接资源不是可下载的媒体资源")
         else:
@@ -1053,7 +1125,8 @@ async def retry_media_download(download_id: int) -> None:
 
         file_size = _path_size(local_path)
         mime_type = _path_mime(local_path)
-        target = await finalize_download(local_path)
+        await progress.reset("正在保存到下载目标", file_size, stage="uploading")
+        target = await finalize_download(local_path, progress)
         await mark_media_download_completed(download_id, local_path, target, file_size=file_size, mime_type=mime_type)
 
         logger.info(

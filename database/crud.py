@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Sequence
 
-from sqlalchemy import select, update, delete
+from sqlalchemy import func, select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import AppSetting, MonitoredGroup, KeywordRule, ScheduledMessage, MessageLog, MediaDownload, _now_cst
@@ -290,6 +290,51 @@ async def update_media_download(
     await session.commit()
     await session.refresh(item)
     return item
+
+
+async def update_media_download_progress(
+    session: AsyncSession,
+    download_id: int,
+    downloaded_bytes: int,
+    total_bytes: int,
+    speed_bps: int,
+    stage: str,
+) -> None:
+    """High-frequency live progress write; only touches rows still running."""
+    await session.execute(
+        update(MediaDownload)
+        .where(MediaDownload.id == download_id, MediaDownload.status == "running")
+        .values(
+            downloaded_bytes=downloaded_bytes,
+            total_bytes=total_bytes,
+            speed_bps=speed_bps,
+            stage=stage,
+            updated_at=_now_cst(),
+        )
+    )
+    await session.commit()
+
+
+async def get_media_download_stats(session: AsyncSession) -> dict:
+    result = await session.execute(
+        select(MediaDownload.status, func.count(MediaDownload.id)).group_by(MediaDownload.status)
+    )
+    counts = {status: int(count) for status, count in result.all()}
+    speed_result = await session.execute(
+        select(func.coalesce(func.sum(MediaDownload.speed_bps), 0)).where(MediaDownload.status == "running")
+    )
+    return {"counts": counts, "total_speed_bps": int(speed_result.scalar() or 0)}
+
+
+async def fail_stale_media_downloads(session: AsyncSession, error: str) -> int:
+    """Mark queued/running rows left over from a previous process run as failed."""
+    result = await session.execute(
+        update(MediaDownload)
+        .where(MediaDownload.status.in_(["queued", "running"]))
+        .values(status="failed", error=error, speed_bps=0, stage="", completed_at=_now_cst(), updated_at=_now_cst())
+    )
+    await session.commit()
+    return result.rowcount or 0
 
 
 # ──────────────────────── AppSetting ────────────────────────
