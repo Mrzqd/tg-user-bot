@@ -25,8 +25,12 @@ def _reaction_update(*, results=None, recent=None, new=None, old=None, min_react
     )
 
 
-def _reaction_count(count: int):
-    return SimpleNamespace(reaction=SimpleNamespace(emoticon="👍"), count=count)
+def _reaction_count(emoji="👍", count=1, chosen_order=None):
+    return SimpleNamespace(
+        reaction=SimpleNamespace(emoticon=emoji),
+        count=count,
+        chosen_order=chosen_order,
+    )
 
 
 class ReactionMatchingTest(unittest.TestCase):
@@ -34,72 +38,107 @@ class ReactionMatchingTest(unittest.TestCase):
         reactions._processed_reactions.clear()
         reactions._inflight_reactions.clear()
 
-    def test_downloads_when_target_reaction_count_disappears(self):
-        update = _reaction_update(results=[])
+    def test_any_reaction_selected_by_me_triggers_download(self):
+        update = _reaction_update(results=[_reaction_count(emoji="❤️", chosen_order=0)])
 
-        matched, reason = reactions._should_process_reaction(update, 10, "👍")
+        matched, reason = reactions._should_process_reaction(update, 10)
 
         self.assertTrue(matched)
-        self.assertEqual(reason, "target emoji count is zero")
+        self.assertEqual(reason, "my reaction selected")
 
-    def test_duplicate_removal_event_is_skipped_after_success(self):
-        update = _reaction_update(results=[])
-        key = reactions._reaction_key(update, 10, "👍")
+    def test_chosen_order_zero_counts_as_my_reaction(self):
+        update = _reaction_update(results=[_reaction_count(chosen_order=0)])
+
+        matched, reason = reactions._should_process_reaction(update, 10)
+
+        self.assertTrue(matched)
+        self.assertEqual(reason, "my reaction selected")
+
+    def test_recent_my_reaction_triggers_when_counts_are_partial(self):
+        update = _reaction_update(
+            results=[],
+            min_reactions=True,
+            recent=[SimpleNamespace(my=True)],
+        )
+
+        matched, reason = reactions._should_process_reaction(update, 10)
+
+        self.assertTrue(matched)
+        self.assertEqual(reason, "my reaction selected")
+
+    def test_single_bot_reaction_from_me_triggers_download(self):
+        update = SimpleNamespace(
+            peer=SimpleNamespace(channel_id=1001),
+            actor=SimpleNamespace(user_id=42),
+            old_reactions=[],
+            new_reactions=[SimpleNamespace(emoticon="🔥")],
+        )
+
+        matched, reason = reactions._should_process_reaction(update, 10, current_user_id=42)
+
+        self.assertTrue(matched)
+        self.assertEqual(reason, "my reaction selected")
+
+    def test_single_bot_reaction_from_other_user_does_not_trigger(self):
+        update = SimpleNamespace(
+            peer=SimpleNamespace(channel_id=1001),
+            actor=SimpleNamespace(user_id=99),
+            old_reactions=[],
+            new_reactions=[SimpleNamespace(emoticon="🔥")],
+        )
+
+        matched, reason = reactions._should_process_reaction(update, 10, current_user_id=42)
+
+        self.assertFalse(matched)
+        self.assertEqual(reason, "my reaction not found")
+
+    def test_other_users_reaction_does_not_trigger(self):
+        update = _reaction_update(results=[_reaction_count(count=2)])
+
+        matched, reason = reactions._should_process_reaction(update, 10)
+
+        self.assertFalse(matched)
+        self.assertEqual(reason, "no reaction selected by me")
+
+    def test_duplicate_my_reaction_event_is_skipped_after_success(self):
+        update = _reaction_update(results=[_reaction_count(chosen_order=0)])
+        key = reactions._reaction_key(update, 10)
         reactions._processed_reactions[key] = 1.0
 
-        matched, reason = reactions._should_process_reaction(update, 10, "👍")
+        matched, reason = reactions._should_process_reaction(update, 10)
 
         self.assertFalse(matched)
         self.assertEqual(reason, "already processed (key=chat:-1001001)")
 
-    def test_new_reaction_rearms_a_processed_message_without_downloading(self):
-        update = _reaction_update(results=[_reaction_count(1)])
-        key = reactions._reaction_key(update, 10, "👍")
+    def test_removal_rearms_message_without_downloading(self):
+        selected = _reaction_update(results=[_reaction_count(chosen_order=0)])
+        removed = _reaction_update(results=[])
+        key = reactions._reaction_key(selected, 10)
         reactions._processed_reactions[key] = 1.0
 
-        matched, reason = reactions._should_process_reaction(update, 10, "👍")
+        matched, reason = reactions._should_process_reaction(removed, 10)
 
         self.assertFalse(matched)
-        self.assertEqual(reason, "target reaction present")
+        self.assertEqual(reason, "no reaction selected by me")
         self.assertNotIn(key, reactions._processed_reactions)
 
-    def test_downloads_explicit_old_reaction_delta(self):
-        update = _reaction_update(
-            old=[SimpleNamespace(emoticon="👍")],
-        )
+    def test_explicit_old_reaction_only_clears_state(self):
+        update = _reaction_update(old=[SimpleNamespace(emoticon="👍")])
 
-        matched, reason = reactions._should_process_reaction(update, 10, "👍")
+        matched, reason = reactions._should_process_reaction(update, 10)
 
-        self.assertTrue(matched)
+        self.assertFalse(matched)
         self.assertEqual(reason, "target reaction removed")
 
-    def test_ignores_new_reaction(self):
-        update = _reaction_update(
-            new=[SimpleNamespace(emoticon="👍")],
-        )
-
-        matched, reason = reactions._should_process_reaction(update, 10, "👍")
-
-        self.assertFalse(matched)
-        self.assertEqual(reason, "target reaction present")
-
-    def test_ignores_target_reaction_count_increase(self):
-        update = _reaction_update(results=[_reaction_count(2)])
-
-        matched, reason = reactions._should_process_reaction(update, 10, "👍")
-
-        self.assertFalse(matched)
-        self.assertEqual(reason, "target reaction present")
-
-    def test_ignores_partial_update_without_target_reaction(self):
+    def test_partial_update_without_my_reaction_is_ignored(self):
         update = _reaction_update(results=[], min_reactions=True)
 
-        matched, reason = reactions._should_process_reaction(update, 10, "👍")
+        matched, reason = reactions._should_process_reaction(update, 10)
 
         self.assertFalse(matched)
-        self.assertEqual(reason, "target emoji not found")
+        self.assertEqual(reason, "my reaction not found")
 
-    def test_bot_reaction_count_list_without_target_triggers_download(self):
+    def test_count_list_without_my_reaction_is_ignored(self):
         update = SimpleNamespace(
             peer=SimpleNamespace(channel_id=1001),
             reactions=[],
@@ -107,23 +146,17 @@ class ReactionMatchingTest(unittest.TestCase):
             old_reactions=[],
         )
 
-        matched, reason = reactions._should_process_reaction(update, 10, "👍")
+        matched, reason = reactions._should_process_reaction(update, 10)
 
-        self.assertTrue(matched)
-        self.assertEqual(reason, "target emoji count is zero")
+        self.assertFalse(matched)
+        self.assertEqual(reason, "no reaction selected by me")
 
     def test_accepts_single_bot_reaction_update_type(self):
         self.assertIn("UpdateBotMessageReaction", reactions.REACTION_UPDATE_TYPES)
 
     def test_message_reaction_key_normalizes_chat_id(self):
-        self.assertEqual(
-            reactions._message_reaction_key(1001, 10, "👍"),
-            ("chat:1001", 10, "👍"),
-        )
-        self.assertEqual(
-            reactions._message_reaction_key("-1001001", 10, "👍"),
-            ("chat:-1001001", 10, "👍"),
-        )
+        self.assertEqual(reactions._message_reaction_key(1001, 10), ("chat:1001", 10))
+        self.assertEqual(reactions._message_reaction_key("-1001001", 10), ("chat:-1001001", 10))
 
 
 class ReactionDownloadTest(unittest.IsolatedAsyncioTestCase):
@@ -137,9 +170,6 @@ class ReactionDownloadTest(unittest.IsolatedAsyncioTestCase):
             id=10,
             chat_id=1001,
             media=SimpleNamespace(),
-            reactions=SimpleNamespace(
-                results=[],
-            ),
         )
         config = SimpleNamespace(reaction_emoji="👍", reaction_notify_chat_id=2001)
         progress_calls: list[str] = []
@@ -186,7 +216,7 @@ class ReactionDownloadTest(unittest.IsolatedAsyncioTestCase):
         reactions._download_and_finish_telegram_messages = fake_download
         reactions._message_media_size = lambda _: 2048
         try:
-            await reactions._process_reacted_media(chat, message, message.id, config, "target emoji count is zero")
+            await reactions._process_reacted_media(chat, message, message.id, config, "my reaction selected")
         finally:
             reactions.userbot._client = originals["client"]
             reactions.DownloadProgress = originals["progress"]

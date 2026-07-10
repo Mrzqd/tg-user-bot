@@ -1,6 +1,6 @@
 """
 Reaction-based media download handler.
-Downloads media when configured emoji reaction is removed from a message,
+Downloads media when the current account selects any emoji reaction,
 then pushes the result to a configured notification chat.
 """
 from __future__ import annotations
@@ -30,13 +30,8 @@ REACTION_UPDATE_TYPES = frozenset({
     "UpdateBotMessageReactions",
 })
 
-_processed_reactions: dict[tuple[str, int, str], float] = {}
-_inflight_reactions: set[tuple[str, int, str]] = set()
-
-
-def _reaction_emoji(reaction) -> str:
-    raw = getattr(reaction, "reaction", reaction)
-    return getattr(raw, "emoticon", "") or getattr(raw, "emoji", "") or str(raw)
+_processed_reactions: dict[tuple[str, int], float] = {}
+_inflight_reactions: set[tuple[str, int]] = set()
 
 
 def _iter_recent_reactions(update):
@@ -64,8 +59,33 @@ def _iter_old_reactions(update):
     return getattr(update, "old_reactions", None) or []
 
 
-def _reaction_count(update, emoji: str) -> int | None:
-    return _reaction_count_from_items(_iter_reaction_counts(update), emoji)
+def _my_reaction_from_counts(update) -> bool:
+    for item in _iter_reaction_counts(update):
+        if getattr(item, "chosen_order", None) is not None:
+            return True
+    return False
+
+
+def _my_recent_reaction(update) -> bool:
+    for item in _iter_recent_reactions(update):
+        if getattr(item, "my", False):
+            return True
+    return False
+
+
+def _my_reaction_from_actor(update, current_user_id: int | None) -> bool:
+    if current_user_id is None:
+        return False
+
+    actor = getattr(update, "actor", None)
+    actor_id = getattr(actor, "user_id", None)
+    if actor_id is None:
+        actor_id = getattr(actor, "id", None)
+    try:
+        is_current_user = actor_id is not None and int(actor_id) == int(current_user_id)
+    except (TypeError, ValueError):
+        is_current_user = False
+    return is_current_user and bool(_iter_new_reactions(update))
 
 
 def _reaction_counts_are_complete(update) -> bool:
@@ -75,17 +95,6 @@ def _reaction_counts_are_complete(update) -> bool:
     if getattr(reactions, "min", False):
         return False
     return getattr(reactions, "results", None) is not None
-
-
-def _reaction_count_from_items(items, emoji: str) -> int | None:
-    total = 0
-    matched = False
-    for item in items or []:
-        if _reaction_emoji(item) != emoji:
-            continue
-        matched = True
-        total += int(getattr(item, "count", 0) or 0)
-    return total if matched else None
 
 
 def _update_msg_id(update) -> int | None:
@@ -116,9 +125,8 @@ def _peer_chat_id(update) -> str:
     return str(peer)
 
 
-def _reaction_key(update, msg_id: int, emoji: str) -> tuple[str, int, str]:
-    """Build cache key from raw update, using same format as _message_reaction_key."""
-    return (f"chat:{_peer_chat_id(update)}", msg_id, emoji)
+def _reaction_key(update, msg_id: int) -> tuple[str, int]:
+    return (f"chat:{_peer_chat_id(update)}", msg_id)
 
 
 def _normalize_chat_id(value) -> str:
@@ -131,11 +139,11 @@ def _normalize_chat_id(value) -> str:
     return str(chat_id)
 
 
-def _message_reaction_key(chat_id: str, msg_id: int, emoji: str) -> tuple[str, int, str]:
-    return (f"chat:{_normalize_chat_id(chat_id)}", msg_id, emoji)
+def _message_reaction_key(chat_id: str, msg_id: int) -> tuple[str, int]:
+    return (f"chat:{_normalize_chat_id(chat_id)}", msg_id)
 
 
-def _clear_reaction_cycle(key: tuple[str, int, str]) -> None:
+def _clear_reaction_cycle(key: tuple[str, int]) -> None:
     _processed_reactions.pop(key, None)
 
 
@@ -145,37 +153,36 @@ def _prune_reaction_cache(now: float) -> None:
         _processed_reactions.pop(key, None)
 
 
-def _should_process_reaction(update, msg_id: int, emoji: str) -> tuple[bool, str]:
-    key = _reaction_key(update, msg_id, emoji)
+def _should_process_reaction(
+    update,
+    msg_id: int,
+    current_user_id: int | None = None,
+) -> tuple[bool, str]:
+    key = _reaction_key(update, msg_id)
 
     if key in _inflight_reactions:
         return False, f"already inflight (key={key[0]})"
 
-    recent_matched = any(_reaction_emoji(item) == emoji for item in _iter_recent_reactions(update))
-    new_matched = any(_reaction_emoji(item) == emoji for item in _iter_new_reactions(update))
-    old_matched = any(_reaction_emoji(item) == emoji for item in _iter_old_reactions(update))
-    current_count = _reaction_count(update, emoji)
+    old_matched = bool(_iter_old_reactions(update))
 
-    if old_matched and not new_matched:
+    if (
+        _my_reaction_from_counts(update)
+        or _my_recent_reaction(update)
+        or _my_reaction_from_actor(update, current_user_id)
+    ):
         if key in _processed_reactions:
             return False, f"already processed (key={key[0]})"
-        return True, "target reaction removed"
+        return True, "my reaction selected"
 
-    if new_matched or recent_matched or (current_count is not None and current_count > 0):
+    if old_matched:
         _clear_reaction_cycle(key)
-        return False, "target reaction present"
-
-    if current_count is not None and current_count <= 0:
-        if key in _processed_reactions:
-            return False, f"already processed (key={key[0]})"
-        return True, "target emoji count is zero"
+        return False, "target reaction removed"
 
     if _reaction_counts_are_complete(update):
-        if key in _processed_reactions:
-            return False, f"already processed (key={key[0]})"
-        return True, "target emoji count is zero"
+        _clear_reaction_cycle(key)
+        return False, "no reaction selected by me"
 
-    return False, "target emoji not found"
+    return False, "my reaction not found"
 
 
 async def _update_chat(update):
@@ -241,7 +248,7 @@ async def _notify_download_failed(chat_id: int, error: Exception | str, message=
 
 async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) -> None:
     source_chat = str(getattr(msg, "chat_id", None) or getattr(chat, "id", ""))
-    key = _message_reaction_key(source_chat, msg_id, config.reaction_emoji.strip() or "👍")
+    key = _message_reaction_key(source_chat, msg_id)
 
     if key in _processed_reactions or key in _inflight_reactions:
         logger.debug("[ReactionDownload] duplicate media skipped msg={} reason={}", msg_id, reason)
@@ -289,7 +296,7 @@ async def _process_reacted_media(chat, msg, msg_id: int, config, reason: str) ->
             item_chat = str(getattr(item, "chat_id", None) or source_chat)
             item_id = int(getattr(item, "id", 0) or 0)
             if item_id:
-                _processed_reactions[_message_reaction_key(item_chat, item_id, config.reaction_emoji.strip() or "👍")] = time.monotonic()
+                _processed_reactions[_message_reaction_key(item_chat, item_id)] = time.monotonic()
         logger.info("[ReactionDownload] msg={} chat={} reason={} count={}", msg_id, chat_title, reason, len(targets))
     finally:
         _inflight_reactions.discard(key)
@@ -308,7 +315,6 @@ def register_reaction_handlers() -> None:
         if not config.reaction_enabled or not config.reaction_notify_chat_id:
             return
 
-        wanted = config.reaction_emoji.strip() or "👍"
         msg_id = _update_msg_id(update)
         if not msg_id:
             return
@@ -316,7 +322,17 @@ def register_reaction_handlers() -> None:
         now = time.monotonic()
         _prune_reaction_cache(now)
 
-        should_process, reason = _should_process_reaction(update, msg_id, wanted)
+        current_user_id = None
+        if update_type == "UpdateBotMessageReaction":
+            current_user_id = getattr(client, "_self_id", None)
+            if current_user_id is None:
+                try:
+                    me = await client.get_me()
+                    current_user_id = getattr(me, "id", None)
+                except Exception as e:
+                    logger.debug("[ReactionDownload] Cannot resolve current user id: {}", e)
+
+        should_process, reason = _should_process_reaction(update, msg_id, current_user_id)
         if not should_process:
             logger.debug(
                 "[ReactionDownload] skipped msg={} type={} peer={} reason={}",
@@ -327,7 +343,7 @@ def register_reaction_handlers() -> None:
         peer_id = _peer_chat_id(update)
         logger.info(
             "[ReactionDownload] matched emoji={} msg={} peer={} type={} reason={}",
-            wanted, msg_id, peer_id, update_type, reason,
+            "any", msg_id, peer_id, update_type, reason,
         )
 
         try:
@@ -344,4 +360,4 @@ def register_reaction_handlers() -> None:
             logger.exception("[ReactionDownload] Failed to process reaction update: {}", e)
             await _notify_download_failed(config.reaction_notify_chat_id, e)
 
-    logger.info("Reaction handlers registered (event-only, trigger=removed)")
+    logger.info("Reaction handlers registered (event-only, trigger=my reaction)")

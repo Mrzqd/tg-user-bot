@@ -146,16 +146,11 @@
       </div>
 
       <div class="mt-6 pt-5 border-t border-border">
-        <h3 class="text-sm font-semibold text-accent mb-4">取消点赞下载</h3>
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <h3 class="text-sm font-semibold text-accent mb-4">点赞下载</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <label class="inline-flex items-center gap-2 text-sm text-dim md:mt-7">
             <input v-model="form.reaction_enabled" type="checkbox" />
-            <span>启用表情监听</span>
-          </label>
-
-          <label class="block">
-            <span class="text-xs text-dim mb-1.5 block">触发表情</span>
-            <input v-model="form.reaction_emoji" class="input-base" placeholder="👍" />
+            <span>启用我的任意表情监听</span>
           </label>
 
           <label class="block">
