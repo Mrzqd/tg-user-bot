@@ -1,92 +1,110 @@
 <template>
   <div class="fade-in">
-    <div class="flex items-center justify-between mb-6">
-      <div>
-        <h2 class="text-xl font-semibold">媒体资源</h2>
-        <p class="text-xs text-dim mt-1">下载记录、目标地址和失败重试</p>
+    <PageHeader title="媒体资源" description="下载记录、保存位置与失败重试">
+      <select v-model="statusFilter" class="input-base !w-32" @change="page = 0; load()">
+        <option value="">全部状态</option>
+        <option value="queued">排队中</option>
+        <option value="running">下载中</option>
+        <option value="completed">已完成</option>
+        <option value="failed">失败</option>
+      </select>
+      <button class="btn-ghost" :disabled="loading" @click="load()">
+        <Icon name="refresh" :size="14" :class="loading ? 'animate-spin' : ''" />
+        刷新
+      </button>
+    </PageHeader>
+
+    <div class="card-table">
+      <div v-if="!loaded" class="py-16 flex justify-center">
+        <Icon name="loader" :size="20" class="animate-spin text-faint" />
       </div>
-      <div class="flex gap-2">
-        <select v-model="statusFilter" class="input-base w-36" @change="page = 0; load()">
-          <option value="">全部状态</option>
-          <option value="queued">排队中</option>
-          <option value="running">下载中</option>
-          <option value="completed">已完成</option>
-          <option value="failed">失败</option>
-        </select>
-        <button class="btn-ghost" :disabled="loading" @click="load">{{ loading ? '刷新中...' : '刷新' }}</button>
+      <div v-else-if="downloads.length" class="overflow-x-auto">
+        <table>
+          <thead>
+            <tr>
+              <th>文件</th>
+              <th>状态</th>
+              <th>保存位置</th>
+              <th>来源</th>
+              <th>时间</th>
+              <th class="!text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in downloads" :key="item.id">
+              <td class="min-w-44">
+                <div class="font-medium max-w-52 truncate" :title="item.file_name">{{ item.file_name || '—' }}</div>
+                <div class="text-[11px] text-faint font-mono mt-0.5">
+                  {{ item.mime_type || item.target_type || '—' }} · {{ fmtBytes(item.file_size) }}
+                </div>
+              </td>
+              <td>
+                <span :class="statusClass(item.status)">
+                  <span v-if="item.status === 'running'" class="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
+                  {{ statusText(item.status) }}
+                </span>
+                <div v-if="item.retry_count" class="text-[11px] text-faint mt-1">已重试 {{ item.retry_count }} 次</div>
+                <div v-if="item.error" class="text-[11px] text-err max-w-52 truncate mt-1" :title="item.error">{{ item.error }}</div>
+              </td>
+              <td class="min-w-60 max-w-80">
+                <div class="font-mono text-xs truncate" :title="item.target_path || item.local_path || ''">
+                  {{ item.target_path || item.local_path || '—' }}
+                </div>
+                <div v-if="item.source_url" class="text-[11px] text-faint font-mono truncate mt-1" :title="item.source_url">
+                  来源：{{ item.source_url }}
+                </div>
+              </td>
+              <td class="min-w-36">
+                <div class="text-xs">{{ sourceText(item.source_type) }} · {{ triggerText(item.trigger_type) }}</div>
+                <div class="text-[11px] text-faint font-mono truncate mt-0.5">
+                  {{ item.source_chat || '—' }} / {{ item.source_message_id || '—' }}
+                </div>
+              </td>
+              <td class="whitespace-nowrap">
+                <div class="text-xs">{{ fmtDate(item.completed_at || item.started_at || item.created_at) }}</div>
+                <div v-if="item.duration_ms" class="text-[11px] text-faint mt-0.5">耗时 {{ fmtDuration(item.duration_ms) }}</div>
+              </td>
+              <td>
+                <div class="flex justify-end">
+                  <button
+                    class="btn-ghost !h-7 !px-2.5 !text-xs"
+                    :disabled="busyId === item.id || item.status === 'running' || item.status === 'queued'"
+                    @click="retry(item)"
+                  >
+                    <Icon name="retry" :size="12" :class="busyId === item.id ? 'animate-spin' : ''" />
+                    {{ busyId === item.id ? '提交中' : '重试' }}
+                  </button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
+      <EmptyState v-else icon="download" title="暂无媒体资源" hint="通过命令、点赞或控制台触发下载后，记录会显示在这里" />
     </div>
 
-    <div class="card overflow-x-auto">
-      <table v-if="downloads.length">
-        <thead>
-          <tr>
-            <th>状态</th>
-            <th>文件</th>
-            <th>媒体地址</th>
-            <th>来源</th>
-            <th>大小</th>
-            <th>下载时间</th>
-            <th>重试</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="item in downloads" :key="item.id">
-            <td>
-              <span class="badge" :class="statusClass(item.status)">{{ statusText(item.status) }}</span>
-            </td>
-            <td class="min-w-44">
-              <div class="text-sm text-white">{{ item.file_name || '—' }}</div>
-              <div class="text-[11px] text-dim font-mono">{{ item.mime_type || item.target_type || '—' }}</div>
-            </td>
-            <td class="min-w-88 max-w-xl">
-              <div class="font-mono text-xs truncate" :title="item.target_path || item.local_path || item.source_url">
-                {{ item.target_path || item.local_path || '—' }}
-              </div>
-              <div class="text-[11px] text-dim font-mono truncate mt-1" :title="item.source_url">
-                来源: {{ item.source_url || '—' }}
-              </div>
-              <div v-if="item.error" class="text-[11px] text-err truncate mt-1" :title="item.error">{{ item.error }}</div>
-            </td>
-            <td class="min-w-40">
-              <div class="text-xs">{{ sourceText(item.source_type) }} · {{ triggerText(item.trigger_type) }}</div>
-              <div class="text-[11px] text-dim font-mono truncate" :title="item.source_url">
-                {{ item.source_chat || '—' }} / {{ item.source_message_id || '—' }}
-              </div>
-            </td>
-            <td class="font-mono text-xs text-dim">{{ fmtBytes(item.file_size) }}</td>
-            <td class="min-w-44">
-              <div class="text-xs">{{ fmt(item.completed_at || item.started_at || item.created_at) }}</div>
-              <div class="text-[11px] text-dim">{{ fmtDuration(item.duration_ms) }}</div>
-            </td>
-            <td class="font-mono text-xs text-dim">{{ item.retry_count }}</td>
-            <td>
-              <button class="btn-sm btn-ghost" :disabled="busyId === item.id || item.status === 'running' || item.status === 'queued'" @click="retry(item)">
-                {{ busyId === item.id ? '提交中' : '重试' }}
-              </button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <div v-else class="text-center py-10 text-dim text-sm">{{ loading ? '加载中...' : '暂无媒体资源' }}</div>
-    </div>
-
-    <div v-if="downloads.length" class="flex justify-center gap-2 mt-5">
-      <button class="btn-sm btn-ghost" :disabled="page <= 0" @click="page--; load()">上一页</button>
-      <span class="text-dim text-sm leading-8">第 {{ page + 1 }} 页</span>
-      <button class="btn-sm btn-ghost" :disabled="downloads.length < pageSize" @click="page++; load()">下一页</button>
-    </div>
+    <TablePagination
+      v-if="loaded && (page > 0 || downloads.length)"
+      :page="page"
+      :has-more="downloads.length >= pageSize"
+      @change="p => { page = p; load() }"
+    />
   </div>
 </template>
 
 <script setup>
 import { inject, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api.js'
+import { fmtDate, fmtBytes, fmtDuration } from '../format.js'
+import Icon from '../components/Icon.vue'
+import PageHeader from '../components/PageHeader.vue'
+import EmptyState from '../components/EmptyState.vue'
+import TablePagination from '../components/TablePagination.vue'
 
 const toast = inject('toast')
 const downloads = ref([])
 const statusFilter = ref('')
+const loaded = ref(false)
 const loading = ref(false)
 const busyId = ref(0)
 const page = ref(0)
@@ -97,37 +115,24 @@ const statusText = (s) => ({ queued: '排队中', running: '下载中', complete
 const sourceText = (s) => ({ telegram_media: 'Telegram 媒体', telegram_message_link: '消息链接', http_url: '网页链接' }[s] || s || '—')
 const triggerText = (s) => ({ command: '命令', reaction: '表情', web: '控制台' }[s] || s || '—')
 const statusClass = (s) => {
-  if (s === 'completed') return 'bg-ok/15 text-ok'
-  if (s === 'failed') return 'bg-err/15 text-err'
-  if (s === 'running' || s === 'queued') return 'bg-warn/15 text-warn'
-  return 'bg-bg-input text-dim'
-}
-const fmt = (s) => s ? new Date(s).toLocaleString('zh-CN') : '—'
-const fmtDuration = (ms) => {
-  if (!ms) return '耗时 —'
-  if (ms < 1000) return `耗时 ${ms} ms`
-  return `耗时 ${(ms / 1000).toFixed(1)} s`
-}
-const fmtBytes = (value) => {
-  if (!value) return '—'
-  let size = Number(value)
-  for (const unit of ['B', 'KB', 'MB', 'GB', 'TB']) {
-    if (size < 1024 || unit === 'TB') return unit === 'B' ? `${size} ${unit}` : `${size.toFixed(2)} ${unit}`
-    size /= 1024
-  }
-  return `${size.toFixed(2)} TB`
+  if (s === 'completed') return 'badge-ok'
+  if (s === 'failed') return 'badge-err'
+  if (s === 'running' || s === 'queued') return 'badge-warn'
+  return 'badge-dim'
 }
 
-async function load() {
-  loading.value = true
+// background = 定时静默刷新：不显示 loading、失败不弹错误，避免界面闪烁和错误刷屏
+async function load(background = false) {
+  if (!background) loading.value = true
   const params = { limit: pageSize, offset: page.value * pageSize }
   if (statusFilter.value) params.status = statusFilter.value
   try {
     downloads.value = await api.getDownloads(params)
   } catch (e) {
-    toast(e.message, 'error')
+    if (!background) toast(e.message, 'error')
   } finally {
     loading.value = false
+    loaded.value = true
   }
 }
 
@@ -136,7 +141,7 @@ async function retry(item) {
   try {
     await api.retryDownload(item.id)
     toast('已提交重试')
-    await load()
+    await load(true)
   } catch (e) {
     toast(e.message, 'error')
   } finally {
@@ -146,7 +151,9 @@ async function retry(item) {
 
 onMounted(() => {
   load()
-  timer = window.setInterval(load, 5000)
+  timer = window.setInterval(() => {
+    if (!document.hidden) load(true)
+  }, 5000)
 })
-onUnmounted(() => { if (timer) window.clearInterval(timer) })
+onUnmounted(() => window.clearInterval(timer))
 </script>

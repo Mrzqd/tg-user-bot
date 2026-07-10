@@ -31,6 +31,12 @@ async function request(path, options = {}) {
     },
   })
   if (!res.ok) {
+    // 会话过期时自动回到登录页（登录接口本身除外，避免刷新循环）
+    if (res.status === 401 && path !== '/auth/login' && getAccessToken()) {
+      setAccessToken('')
+      location.reload()
+      return new Promise(() => {})
+    }
     const body = await res.json().catch(() => ({}))
     throw new Error(body.detail || `HTTP ${res.status}`)
   }

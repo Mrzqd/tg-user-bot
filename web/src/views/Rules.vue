@@ -1,42 +1,89 @@
 <template>
   <div class="fade-in">
-    <div class="flex items-center justify-between mb-6">
-      <h2 class="text-xl font-semibold">关键词规则</h2>
-      <button class="btn-primary" @click="openAdd">+ 添加规则</button>
-    </div>
-    <div class="card overflow-x-auto">
-      <table v-if="rules.length">
-        <thead><tr><th>#</th><th>关键词</th><th>动作</th><th>回复/按钮</th><th>条件</th><th>作用域</th><th>话题</th><th>正则</th><th>发送方式</th><th>延迟</th><th>自动删除</th><th>状态</th><th class="w-32">操作</th></tr></thead>
-        <tbody>
-          <tr v-for="r in rules" :key="r.id">
-            <td class="font-mono text-xs">{{ r.id }}</td>
-            <td class="font-mono text-xs text-accent max-w-36 truncate">{{ r.keyword }}</td>
-            <td><span class="badge text-xs" :class="r.action === 'click_button' ? 'bg-warn/15 text-warn' : 'bg-accent/15 text-accent'">{{ r.action === 'click_button' ? '点击按钮' : '回复' }}</span></td>
-            <td class="max-w-40 truncate text-xs">{{ r.action === 'click_button' ? (r.click_text || '第一个按钮') + (r.reply_text ? ' + ' + r.reply_text : '') : r.reply_text }}</td>
-            <td class="max-w-32 truncate text-xs font-mono" :title="r.condition">{{ r.condition || '—' }}</td>
-            <td class="font-mono text-xs">{{ r.chat_id === 0 ? '全部' : r.chat_id }}</td>
-            <td class="font-mono text-xs">{{ r.topic_id ? r.topic_id : '全部' }}</td>
-            <td>{{ r.is_regex ? '是' : '—' }}</td>
-            <td><span class="badge text-xs" :class="r.no_quote ? 'bg-warn/15 text-warn' : 'bg-accent/15 text-accent'">{{ r.no_quote ? '直发' : '引用' }}</span></td>
-            <td>{{ r.reply_delay ? r.reply_delay + '秒' : '—' }}</td>
-            <td>{{ r.delete_after ? r.delete_after + '秒' : '—' }}</td>
-            <td><span :class="r.is_active ? 'badge-on' : 'badge-off'">{{ r.is_active ? '启用' : '停用' }}</span></td>
-            <td class="flex gap-1">
-              <button class="btn-icon" @click="openEdit(r)" title="编辑">✎</button>
-              <button class="btn-icon" @click="toggle(r)">{{ r.is_active ? '⏸' : '▶' }}</button>
-              <button class="btn-icon hover:!text-err" @click="remove(r)" title="删除">✕</button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <div v-else class="text-center py-10 text-dim text-sm">暂无关键词规则</div>
+    <PageHeader title="关键词规则" description="命中关键词后自动回复或点击按钮">
+      <button class="btn-primary" @click="openAdd">
+        <Icon name="plus" :size="15" />
+        添加规则
+      </button>
+    </PageHeader>
+
+    <div class="card-table">
+      <div v-if="!loaded" class="py-16 flex justify-center">
+        <Icon name="loader" :size="20" class="animate-spin text-faint" />
+      </div>
+      <div v-else-if="rules.length" class="overflow-x-auto">
+        <table>
+          <thead>
+            <tr>
+              <th>关键词</th>
+              <th>动作</th>
+              <th>作用域</th>
+              <th>触发条件</th>
+              <th>行为</th>
+              <th>状态</th>
+              <th class="w-24 !text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in rules" :key="r.id">
+              <td>
+                <div class="flex items-center gap-1.5">
+                  <code class="font-mono text-xs text-accent-light max-w-40 truncate" :title="r.keyword">{{ r.keyword }}</code>
+                  <span v-if="r.is_regex" class="tag !text-accent-light !border-accent/30">正则</span>
+                </div>
+                <div class="text-[11px] text-faint mt-0.5">#{{ r.id }}</div>
+              </td>
+              <td>
+                <span :class="r.action === 'click_button' ? 'badge-warn' : 'badge-accent'">
+                  {{ r.action === 'click_button' ? '点击按钮' : '文字回复' }}
+                </span>
+                <div class="text-[11px] text-dim max-w-44 truncate mt-1" :title="actionContent(r)">{{ actionContent(r) }}</div>
+              </td>
+              <td>
+                <div class="font-mono text-xs">{{ r.chat_id === 0 ? '全部群组' : r.chat_id }}</div>
+                <div class="text-[11px] text-faint mt-0.5">{{ r.topic_id ? `话题 ${r.topic_id}` : '全部话题' }}</div>
+              </td>
+              <td>
+                <code v-if="r.condition" class="font-mono text-[11px] text-dim block max-w-36 truncate" :title="r.condition">{{ r.condition }}</code>
+                <span v-else class="text-faint text-xs">—</span>
+              </td>
+              <td>
+                <div class="flex flex-wrap gap-1">
+                  <span class="tag">{{ r.no_quote ? '直发' : '引用' }}</span>
+                  <span v-if="r.reply_delay" class="tag">延迟 {{ r.reply_delay }}s</span>
+                  <span v-if="r.delete_after" class="tag">{{ r.delete_after }}s 后删</span>
+                </div>
+              </td>
+              <td>
+                <ToggleSwitch :model-value="r.is_active" @update:model-value="toggle(r)" />
+              </td>
+              <td>
+                <div class="flex justify-end gap-0.5">
+                  <button class="btn-icon" title="编辑" @click="openEdit(r)">
+                    <Icon name="pencil" :size="15" />
+                  </button>
+                  <button class="btn-icon-danger" title="删除" @click="remove(r)">
+                    <Icon name="trash" :size="15" />
+                  </button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <EmptyState v-else icon="zap" title="暂无关键词规则" hint="添加规则后，机器人会在监控群组中自动响应命中的消息">
+        <button class="btn-primary" @click="openAdd">
+          <Icon name="plus" :size="15" />
+          添加规则
+        </button>
+      </EmptyState>
     </div>
 
-    <ModalDialog v-if="showAdd" title="添加关键词规则" @close="showAdd = false" @confirm="add">
+    <ModalDialog v-if="showAdd" title="添加关键词规则" confirm-text="添加" :busy="saving" wide @close="showAdd = false" @confirm="add">
       <RuleForm v-model="form" />
     </ModalDialog>
 
-    <ModalDialog v-if="showEdit" title="编辑关键词规则" confirm-text="更新" @close="showEdit = false" @confirm="update">
+    <ModalDialog v-if="showEdit" title="编辑关键词规则" confirm-text="更新" :busy="saving" wide @close="showEdit = false" @confirm="update">
       <RuleForm v-model="editForm" />
     </ModalDialog>
   </div>
@@ -45,20 +92,71 @@
 <script setup>
 import { ref, inject, onMounted } from 'vue'
 import { api } from '../api.js'
+import Icon from '../components/Icon.vue'
+import PageHeader from '../components/PageHeader.vue'
 import ModalDialog from '../components/ModalDialog.vue'
+import ToggleSwitch from '../components/ToggleSwitch.vue'
+import EmptyState from '../components/EmptyState.vue'
 import RuleForm from '../components/RuleForm.vue'
 
 const toast = inject('toast')
+const confirmDialog = inject('confirm')
+
 const rules = ref([])
+const loaded = ref(false)
 const showAdd = ref(false)
 const showEdit = ref(false)
+const saving = ref(false)
 const editingId = ref(null)
-const mkForm = () => ({ keyword: '', reply_text: '', chat_id: 0, topic_id: 0, action: 'reply', click_text: '', condition: '', is_regex: false, no_quote: false, reply_delay: 0, delete_after: 0 })
+
+const mkForm = () => ({
+  keyword: '', reply_text: '', chat_id: 0, topic_id: 0, action: 'reply',
+  click_text: '', condition: '', is_regex: false, no_quote: false,
+  reply_delay: 0, delete_after: 0,
+})
 const form = ref(mkForm())
 const editForm = ref(mkForm())
 
-async function load() { try { rules.value = await api.getRules() } catch (e) { toast(e.message, 'error') } }
-function openAdd() { form.value = mkForm(); showAdd.value = true }
+const actionContent = (r) => r.action === 'click_button'
+  ? `点击「${r.click_text || '第一个按钮'}」${r.reply_text ? `，附加回复 ${r.reply_text}` : ''}`
+  : r.reply_text
+
+function toPayload(f) {
+  return {
+    keyword: f.keyword,
+    reply_text: f.reply_text,
+    chat_id: Number(f.chat_id) || 0,
+    topic_id: f.topic_id || 0,
+    action: f.action || 'reply',
+    click_text: f.click_text || '',
+    condition: f.condition || '',
+    is_regex: Boolean(f.is_regex),
+    no_quote: Boolean(f.no_quote),
+    reply_delay: f.reply_delay || 0,
+    delete_after: f.delete_after || 0,
+  }
+}
+
+function validate(f) {
+  if (!String(f.keyword).trim()) return '请输入关键词'
+  if (f.action !== 'click_button' && !String(f.reply_text).trim()) return '请输入回复内容'
+  return ''
+}
+
+async function load() {
+  try {
+    rules.value = await api.getRules()
+  } catch (e) {
+    toast(e.message, 'error')
+  } finally {
+    loaded.value = true
+  }
+}
+
+function openAdd() {
+  form.value = mkForm()
+  showAdd.value = true
+}
 
 function openEdit(r) {
   editingId.value = r.id
@@ -79,23 +177,56 @@ function openEdit(r) {
 }
 
 async function add() {
+  const err = validate(form.value)
+  if (err) return toast(err, 'error')
+  saving.value = true
   try {
-    await api.addRule({ keyword: form.value.keyword, reply_text: form.value.reply_text, chat_id: Number(form.value.chat_id) || 0, topic_id: form.value.topic_id || 0, action: form.value.action || 'reply', click_text: form.value.click_text || '', condition: form.value.condition || '', is_regex: form.value.is_regex, no_quote: form.value.no_quote || false, reply_delay: form.value.reply_delay || 0, delete_after: form.value.delete_after || 0 })
-    toast('规则已添加'); showAdd.value = false; await load()
-  } catch (e) { toast(e.message, 'error') }
+    await api.addRule(toPayload(form.value))
+    toast('规则已添加')
+    showAdd.value = false
+    await load()
+  } catch (e) {
+    toast(e.message, 'error')
+  } finally {
+    saving.value = false
+  }
 }
 
 async function update() {
+  const err = validate(editForm.value)
+  if (err) return toast(err, 'error')
+  saving.value = true
   try {
-    await api.updateRule(editingId.value, { keyword: editForm.value.keyword, reply_text: editForm.value.reply_text, chat_id: Number(editForm.value.chat_id) || 0, topic_id: editForm.value.topic_id || 0, action: editForm.value.action || 'reply', click_text: editForm.value.click_text || '', condition: editForm.value.condition || '', is_regex: editForm.value.is_regex, no_quote: editForm.value.no_quote || false, reply_delay: editForm.value.reply_delay || 0, delete_after: editForm.value.delete_after || 0 })
-    toast('规则已更新'); showEdit.value = false; await load()
-  } catch (e) { toast(e.message, 'error') }
+    await api.updateRule(editingId.value, toPayload(editForm.value))
+    toast('规则已更新')
+    showEdit.value = false
+    await load()
+  } catch (e) {
+    toast(e.message, 'error')
+  } finally {
+    saving.value = false
+  }
 }
 
-async function toggle(r) { try { await api.toggleRule(r.id, !r.is_active); await load() } catch (e) { toast(e.message, 'error') } }
+async function toggle(r) {
+  try {
+    await api.toggleRule(r.id, !r.is_active)
+    await load()
+  } catch (e) {
+    toast(e.message, 'error')
+  }
+}
+
 async function remove(r) {
-  if (!confirm(`确定删除规则 #${r.id}？`)) return
-  try { await api.deleteRule(r.id); toast('规则已删除'); await load() } catch (e) { toast(e.message, 'error') }
+  const ok = await confirmDialog(`确定删除规则 #${r.id}（${r.keyword}）？`, { title: '删除规则', confirmText: '删除' })
+  if (!ok) return
+  try {
+    await api.deleteRule(r.id)
+    toast('规则已删除')
+    await load()
+  } catch (e) {
+    toast(e.message, 'error')
+  }
 }
 
 onMounted(load)
